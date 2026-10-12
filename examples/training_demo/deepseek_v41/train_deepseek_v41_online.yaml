@@ -12,6 +12,8 @@ model:
   # baseline on a single 16-device validation host.
   text_parameter_divisor: 8
   num_routed_experts: 16
+  # Profiling only: true forces expert round robin with matching gate weights.
+  fix_router: false
   # Exercise the released decoder's post-training Full -> Reindex hierarchy
   # at its native layer indices while keeping a larger-than-TopK candidate pool.
   exercise_post_training_indexer: true

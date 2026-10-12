@@ -29,7 +29,9 @@ import math
 import os
 from typing import Optional
 
-import torch
+import torch  # pylint: disable=forbidden-backend-import
+
+from hyper_parallel.components.functional.fix_router import fixed_topk_routing
 
 logger = logging.getLogger(__name__)
 
@@ -118,7 +120,7 @@ def _mask_scores_by_group(scores, n_group, topk_group):
     return scores.masked_fill(~score_mask.bool(), float("-inf"))
 
 
-def _sigmoid_group_router(module, hidden_states):
+def _sigmoid_group_router(module, hidden_states, *, fix_router: bool = False):
     """deepseekv3/glm4moe adapter: sigmoid + e_score_correction_bias +
     group-limited topk + (optional) normalization + routed_scaling_factor
     (step-by-step consistent with HF DeepseekV3MoE.route_tokens_to_experts /
@@ -157,7 +159,11 @@ def _sigmoid_group_router(module, hidden_states):
         )
 
     topk_idx = scores_for_choice.topk(top_k, dim=-1, sorted=False)[1]
-    topk_w = scores.gather(1, topk_idx)
+    if fix_router:
+        local_count = getattr(getattr(module, "experts", None), "local_expert_count", 1)
+        topk_idx, topk_w = fixed_topk_routing(scores, topk_idx, local_expert_count=local_count)
+    else:
+        topk_w = scores.gather(1, topk_idx)
     if _attr("norm_topk_prob", False):
         topk_w = topk_w / (topk_w.sum(dim=-1, keepdim=True) + 1e-20)
     topk_w = topk_w * float(_attr("routed_scaling_factor", 1.0))
@@ -352,26 +358,6 @@ def _expert_major_order(flat_expert: "torch.Tensor", num_experts: int) -> "torch
     return torch.argsort(flat_expert, stable=True)
 
 
-def _global_expert_count(module):
-    """Model-level routed expert count (mirrors ``experts._get_global_expert_count``).
-
-    Kept local so this module stays a torch-only leaf (it is imported by
-    model adapters that do not want the expert compute machinery).
-    """
-    for owner in (getattr(module, "experts", None), module):
-        count = getattr(owner, "num_experts", None)
-        if count is not None:
-            return int(count)
-    cfg = getattr(module, "config", None)
-    for name in ("num_experts", "n_routed_experts"):
-        count = getattr(cfg, name, None)
-        if count is not None:
-            return int(count)
-    raise ValueError(
-        f"{type(module).__name__}: cannot determine the global routed expert count"
-    )
-
-
 def _balanced_router(module, hidden_states):
     """deepseekv3 adapter variant with a deliberately uniform expert load.
 
@@ -379,8 +365,9 @@ def _balanced_router(module, hidden_states):
     round-robin assignment that spreads the local slots over the **destination
     ranks**: local slot ``i`` goes to one of the ``L`` experts owned by
     destination ``i mod Q``, where ``Q = E/L`` and ``L`` is the per-rank expert
-    count (``module.experts.local_expert_count``). Every rank therefore
-    receives exactly ``T*K/EP`` tokens instead of a data-dependent count.
+    count (``module.experts.local_expert_count``). Every destination receives
+    ``T*K/EP`` slots when ``T*K`` is divisible by EP; otherwise local sender
+    counts differ by at most one.
 
     Spreading by *rank* rather than by expert is what makes this exact: the
     per-expert token count cannot be made uniform at all when ``E`` does not
@@ -407,31 +394,11 @@ def _balanced_router(module, hidden_states):
 
     Correctness must be validated with the switch OFF (``fix_router:
     False``), where the real ``_sigmoid_group_router`` runs unchanged. The
-    true ``topk_w`` are kept so the gate still receives gradient and the
-    router GEMM stays in the step's compute profile.
+    Weights are gathered for the replacement experts, then normalized and
+    scaled as usual. The gate still receives gradients for those experts,
+    and the router GEMM stays in the step's compute profile.
     """
-    topk_idx, topk_w = _sigmoid_group_router(module, hidden_states)
-    token_count, experts_per_token = topk_idx.shape
-    expert_count = _global_expert_count(module)
-    # Set by the EP binder (bind_local_expert_forward) before any forward; a
-    # missing value degrades to a plain per-expert round robin.
-    local_count = getattr(
-        getattr(module, "experts", None), "local_expert_count", None) or 1
-    if expert_count % local_count != 0:
-        raise ValueError(
-            f"num_experts ({expert_count}) must be divisible by the local "
-            f"expert count ({local_count})"
-        )
-    # Spread the slots over DESTINATION RANKS first (slot % destinations), then
-    # over that rank's local experts: every rank receives exactly one out of
-    # every `destinations` slots.
-    destinations = expert_count // local_count
-    slots = torch.arange(
-        token_count * experts_per_token, device=topk_idx.device)
-    balanced_idx = ((slots % destinations) * local_count
-                    + (slots // destinations) % local_count)
-    return balanced_idx.view(
-        token_count, experts_per_token).to(topk_idx.dtype), topk_w
+    return _sigmoid_group_router(module, hidden_states, fix_router=True)
 
 
 MOE_ROUTER_ADAPTERS = {

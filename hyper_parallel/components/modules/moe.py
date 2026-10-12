@@ -38,10 +38,12 @@ __all__ = [
 import math
 from typing import Any
 
-import torch
-import torch.nn.functional as F
-from torch import nn
+import torch  # pylint: disable=forbidden-backend-import
+import torch.distributed as dist  # pylint: disable=forbidden-backend-import
+import torch.nn.functional as F  # pylint: disable=forbidden-backend-import
+from torch import nn  # pylint: disable=forbidden-backend-import
 
+from hyper_parallel.components.functional.fix_router import fixed_topk_routing
 from hyper_parallel.components.functional.npu_grouped_swiglu import npu_grouped_swiglu
 from hyper_parallel.core.dtensor.dtensor import DTensor
 
@@ -352,6 +354,8 @@ class TokenChoiceTopKRouter(nn.Module):
             when ``num_expert_groups`` is not ``None``.
         route_scale: Scalar multiplier applied to routing scores.
             Defaults to ``1.0``.
+        fix_router: Force deterministic expert round robin for profiling.
+            Defaults to ``False``; routing weights still come from the gate.
 
     Example::
         >>> router = TokenChoiceTopKRouter(dim=64, num_experts=8, top_k=2)
@@ -369,6 +373,7 @@ class TokenChoiceTopKRouter(nn.Module):
         num_expert_groups: int | None = None,
         num_limited_groups: int | None = None,
         route_scale: float = 1.0,
+        fix_router: bool = False,
     ) -> None:
         """Initialize the top-K router.
 
@@ -380,8 +385,13 @@ class TokenChoiceTopKRouter(nn.Module):
             num_expert_groups: Number of expert groups for node-limited routing.
             num_limited_groups: Number of groups each token can route to.
             route_scale: Scalar multiplier applied to routing scores.
+            fix_router: Force balanced routing for profiling only.
         """
         super().__init__()
+        if num_experts <= 0 or not 1 <= top_k <= num_experts:
+            raise ValueError("require num_experts > 0 and 1 <= top_k <= num_experts")
+        if not isinstance(fix_router, bool):
+            raise ValueError("fix_router must be a bool")
         if score_func not in ("sigmoid", "softmax"):
             raise ValueError(
                 f"score_func must be 'sigmoid' or 'softmax', got '{score_func}'."
@@ -397,6 +407,7 @@ class TokenChoiceTopKRouter(nn.Module):
         self.num_expert_groups = num_expert_groups
         self.num_limited_groups = num_limited_groups
         self.route_scale = route_scale
+        self.fix_router = fix_router
 
     def forward(
         self,
@@ -441,7 +452,10 @@ class TokenChoiceTopKRouter(nn.Module):
 
         top_scores, selected_experts = scores_with_bias.topk(self.top_k, dim=-1)
         # Gather unbiased scores as the actual routing weights.
-        top_scores = scores.gather(1, selected_experts)
+        if self.fix_router:
+            selected_experts, top_scores = fixed_topk_routing(scores, selected_experts)
+        else:
+            top_scores = scores.gather(1, selected_experts)
 
         num_tokens_per_expert = torch.bincount(
             selected_experts.flatten(), minlength=self.num_experts
@@ -516,8 +530,6 @@ def _compute_load_balance_loss(
     Returns:
         Scalar loss tensor. Returns 0.0 for empty input.
     """
-    import torch.distributed as dist  # pylint: disable=C0415
-
     num_tokens, top_k = top_scores.shape
 
     if num_tokens == 0:

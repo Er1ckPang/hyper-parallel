@@ -43,6 +43,7 @@ from transformers.models.deepseek_v4.modeling_deepseek_v4 import (
     apply_rotary_pos_emb,
 )
 
+from hyper_parallel.components.functional.fix_router import fixed_topk_routing
 from hyper_parallel.components.functional.sinkhorn import sinkhorn_knopps
 from hyper_parallel.components.modules.engram import EngramModule, NgramHashMapping
 from hyper_parallel.components.modules.mhc import PipelinedMhcModule, pipelined_mhc_post
@@ -129,7 +130,14 @@ class DeepseekV41Engram(nn.Module):
             segment_starts: torch.Tensor | None = None,
             token_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Apply the released hash lookup and gated residual update."""
+        """Apply the released hash lookup and gated residual update.
+
+        Args:
+            hidden_states: Token states with a hyper-connection stream axis.
+            input_ids: Token IDs used by the n-gram hash lookup.
+            segment_starts: Optional segment boundaries for the hash lookup.
+            token_mask: Optional mask selecting valid tokens for the update.
+        """
         hash_ids = self.hash_mapping(input_ids, segment_starts, token_mask)
         embeddings = self.embed(hash_ids)
         key_value = self.wkv(embeddings.flatten(start_dim=-2))
@@ -169,6 +177,9 @@ class DeepseekV41TopKRouter(nn.Module):
         self.top_k = int(config.num_experts_per_tok)
         self.scoring_func = str(config.scoring_func)
         self.routed_scaling_factor = float(config.routed_scaling_factor)
+        self.fix_router = getattr(config, "moe_router_force_expert_balance", False)
+        if not isinstance(self.fix_router, bool):
+            raise ValueError("moe_router_force_expert_balance must be a bool")
         self.weight = nn.Parameter(torch.empty(self.num_experts, self.hidden_size))
         self.bias = nn.Parameter(torch.zeros(self.num_experts, dtype=torch.float32))
         if bool(getattr(config, "v41_vision_enabled", False)):
@@ -185,6 +196,10 @@ class DeepseekV41TopKRouter(nn.Module):
 
         ``bias`` and ``bias_vl`` select experts only; the gathered routing
         weights intentionally use the unbiased scores, matching V4.1.
+
+        Args:
+            hidden_states: Token states, flattened before the gate projection.
+            image_mask: Optional boolean image-token mask of shape ``[B, S]``.
         """
         flattened = hidden_states.reshape(-1, self.hidden_size)
         logits = functional.linear(  # pylint: disable=not-callable
@@ -209,7 +224,10 @@ class DeepseekV41TopKRouter(nn.Module):
                     self.bias.unsqueeze(0),
                 )
         indices = torch.topk(scores + correction_bias, self.top_k, dim=-1, sorted=False).indices
-        weights = scores.gather(1, indices)
+        if self.fix_router:
+            indices, weights = fixed_topk_routing(scores, indices)
+        else:
+            weights = scores.gather(1, indices)
         if self.top_k > 1:
             weights = weights / (weights.sum(dim=-1, keepdim=True) + 1.0e-20)
         return logits, weights * self.routed_scaling_factor, indices
@@ -248,7 +266,12 @@ class DeepseekV41Compressor(nn.Module):
             hidden_states: torch.Tensor,
             compress_position_embeddings: tuple[torch.Tensor, torch.Tensor],
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return unrotated and RoPE-rotated compressed KV tensors."""
+        """Return unrotated and RoPE-rotated compressed KV tensors.
+
+        Args:
+            hidden_states: Token states of shape ``[B, S, H]``.
+            compress_position_embeddings: Cosine and sine embeddings for RoPE.
+        """
         batch_size, sequence_length, _ = hidden_states.shape
         if self.compress_ratio == 1:
             latent = self.norm(self.wkv(hidden_states))
@@ -359,7 +382,11 @@ class DeepseekV41PipelinedHyperConnection(nn.Module):
             self,
             hidden_streams: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Compute V4.1 pre, post, and residual mixing coefficients."""
+        """Compute V4.1 pre, post, and residual mixing coefficients.
+
+        Args:
+            hidden_streams: Input states including the hyper-connection stream axis.
+        """
         flattened = self.input_norm(hidden_streams.flatten(start_dim=2).float())
         mix = functional.linear(flattened, self.fn.float())  # pylint: disable=not-callable
         num_stream = self.hc_mult
@@ -797,7 +824,12 @@ class DeepseekV41ForCausalLM(DeepseekV4ForCausalLM):
 
     @classmethod
     def from_config(cls, config: Any, **kwargs: Any) -> "DeepseekV41ForCausalLM":
-        """Construct the model from its translated V4.1 configuration."""
+        """Construct the model from its translated V4.1 configuration.
+
+        Args:
+            config: Translated model configuration with V4.1 extension fields.
+            kwargs: Optional builder arguments, ignored by this constructor.
+        """
         del kwargs
         return cls(config)
 

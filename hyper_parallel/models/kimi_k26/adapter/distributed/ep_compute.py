@@ -38,78 +38,14 @@ from hyper_parallel.distributed.recipe_spec import local_compute
 logger = logging.getLogger(__name__)
 
 
-def _global_expert_count(module: Any) -> int:
-    """Return the model-level routed expert count.
-
-    Mirrors ``expert_parallel.experts``' own resolution so the family keeps its
-    router self-contained: the module (or its ``experts`` child) may carry
-    ``num_experts``, otherwise the config declares ``num_experts`` /
-    ``n_routed_experts``.
-
-    Raises:
-        ValueError: If no owner exposes a routed expert count.
-    """
-    for owner in (getattr(module, "experts", None), module):
-        count = getattr(owner, "num_experts", None)
-        if count is not None:
-            return int(count)
-    config = getattr(module, "config", None)
-    for name in ("num_experts", "n_routed_experts"):
-        count = getattr(config, name, None)
-        if count is not None:
-            return int(count)
-    raise ValueError(
-        f"{type(module).__name__}: cannot determine the global routed expert count"
-    )
-
-
-def _balanced_expert_indices(
-        token_count: int,
-        experts_per_token: int,
-        expert_count: int,
-        local_count: int,
-        *,
-        device: Any,
-) -> torch.Tensor:
-    """Round-robin ``[token_count, experts_per_token]`` slots over destination ranks.
-
-    Local slot ``i`` is sent to destination ``i % Q`` (``Q = expert_count /
-    local_count``), landing on that rank's local expert ``(i // Q) % local_count``.
-    Spreading by *rank* first is what makes the load exact: a per-expert round
-    robin (``i % expert_count``) replays the same residue pattern on every rank,
-    so the leftover slots pile onto a fixed group of ranks.
-
-    Args:
-        token_count: Local tokens ``T``.
-        experts_per_token: Routed experts per token ``K``.
-        expert_count: Global routed experts ``E``.
-        local_count: Experts this rank owns ``L``.
-        device: Device for the returned index tensor.
-
-    Returns:
-        ``[T, K]`` int64 indices naming the expert each slot is routed to.
-
-    Raises:
-        ValueError: If ``E`` is not divisible by ``L``.
-    """
-    if expert_count % local_count != 0:
-        raise ValueError(
-            f"num_experts ({expert_count}) must be divisible by the local "
-            f"expert count ({local_count})"
-        )
-    destinations = expert_count // local_count
-    slots = torch.arange(token_count * experts_per_token, device=device)
-    indices = (slots % destinations) * local_count + (slots // destinations) % local_count
-    return indices.view(token_count, experts_per_token)
-
-
 def _balanced_router(module: Any, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """``deepseekv3`` router variant with a deliberately uniform expert load.
 
     Runs the real sigmoid-group router to keep the gate in the compute profile
-    and its weights differentiable, then *replaces the destination* of every
-    slot with a round-robin assignment: every rank receives exactly ``T*K/EP``
-    tokens instead of a data-dependent count. Measured on the 293B/18-layer
+    and its weights differentiable, then replaces each destination with a
+    round-robin assignment and gathers that expert's unbiased score. Each
+    rank receives ``T*K/EP`` slots when the slot count is divisible by EP.
+    Measured on the 293B/18-layer
     config, the real router put 6.3x the mean token count on the busiest rank
     (leaving some experts empty) while this one stays at 1.00x.
 
@@ -117,19 +53,7 @@ def _balanced_router(module: Any, hidden_states: torch.Tensor) -> tuple[torch.Te
     scores, so ``loss`` / ``grad_norm`` and expert-hit distributions from this
     mode are meaningless.
     """
-    topk_idx, topk_w = MOE_ROUTER_ADAPTERS["deepseekv3"](module, hidden_states)
-    token_count, experts_per_token = topk_idx.shape
-    local_count = int(
-        getattr(getattr(module, "experts", None), "local_expert_count", None) or 1
-    )
-    balanced_idx = _balanced_expert_indices(
-        int(token_count),
-        int(experts_per_token),
-        _global_expert_count(module),
-        local_count,
-        device=topk_idx.device,
-    )
-    return balanced_idx.to(topk_idx.dtype), topk_w
+    return MOE_ROUTER_ADAPTERS["deepseekv3_fixed"](module, hidden_states)
 
 
 @local_compute
@@ -188,12 +112,24 @@ def kimi_k26_ep_compute_fn(
         routed: torch.Tensor,
         overlapped: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Merge the routed branch with the shared-experts branch."""
+        """Merge the routed branch with the shared-experts branch.
+
+        Args:
+            module: MoE block owning the shared experts.
+            hidden_states: Token states for shared-expert computation.
+            routed: Combined routed-expert output.
+            overlapped: Optional shared output computed during dispatch.
+        """
         shared = module.shared_experts(hidden_states) if overlapped is None else overlapped
         return routed + shared    # nested boundary
 
     def overlap_shared(module: Any, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Shared-experts branch, evaluated while the dispatch exchange is in flight."""
+        """Shared-experts branch, evaluated while the dispatch exchange is in flight.
+
+        Args:
+            module: MoE block owning the shared experts.
+            hidden_states: Token states for shared-expert computation.
+        """
         return module.shared_experts(hidden_states)    # nested boundary
 
     return build_ep_compute(

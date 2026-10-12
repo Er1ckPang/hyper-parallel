@@ -260,6 +260,7 @@ def build_deepseek_v41_validation_config(
         num_routed_experts: int = 16,
         exercise_post_training_indexer: bool = True,
         indexer_loss_coeff: float = 1.0e-3,
+        fix_router: bool = False,
 ) -> DeepseekV4Config:
     """Translate the released config into a depth-preserving parameter crop.
 
@@ -282,6 +283,7 @@ def build_deepseek_v41_validation_config(
             exercises candidate selection before the released Reindex layers.
         indexer_loss_coeff: Sparse-stage Indexer KL coefficient. The released
             report does not disclose its production value.
+        fix_router: Force expert round robin in learned routers for profiling.
 
     Returns:
         A Transformers DeepSeek-V4 config carrying V4.1 extension fields.
@@ -289,6 +291,8 @@ def build_deepseek_v41_validation_config(
     Raises:
         ValueError: If the source, parameter crop, or assets are inconsistent.
     """
+    if not isinstance(fix_router, bool):
+        raise ValueError("fix_router must be a bool")
     source, text, assets, assets_path, released_hidden_layers = _load_validation_sources(
         config_path, engram_assets_path
     )
@@ -308,6 +312,7 @@ def build_deepseek_v41_validation_config(
         indexer_loss_coeff,
     )
     _apply_v41_vision_fields(config, source, enable_vision, vision_parameter_divisor)
+    config.moe_router_force_expert_balance = fix_router
     config._attn_implementation = "eager"  # pylint: disable=protected-access
     return config
 
@@ -330,6 +335,7 @@ def build_cropped_deepseek_v41(
         activation_checkpoint_selection: Any | None = None,
         activation_swap: str = "none",
         model_init_dtype: str = "float32",
+        fix_router: bool = False,
 ) -> PreTrainedModel:
     """Build and parallelize the depth-preserving V4.1 parameter crop.
 
@@ -352,6 +358,7 @@ def build_cropped_deepseek_v41(
         activation_checkpoint_selection: Optional adapter-safe region selection.
         activation_swap: Activation-swap mode.
         model_init_dtype: Final parameter initialization dtype.
+        fix_router: Force expert round robin in learned routers for profiling.
 
     Returns:
         Parallelized, randomly initialized V4.1 validation model.
@@ -365,6 +372,7 @@ def build_cropped_deepseek_v41(
         num_routed_experts=num_routed_experts,
         exercise_post_training_indexer=exercise_post_training_indexer,
         indexer_loss_coeff=indexer_loss_coeff,
+        fix_router=fix_router,
     )
     return HyperAutoModelForCausalLM.from_config(
         config,

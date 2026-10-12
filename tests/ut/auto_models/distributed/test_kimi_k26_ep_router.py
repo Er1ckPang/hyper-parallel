@@ -29,6 +29,7 @@ import torch  # pylint: disable=wrong-import-position
 
 from tests.common.mark_utils import arg_mark  # pylint: disable=wrong-import-position
 
+from hyper_parallel.components.functional.fix_router import fixed_expert_indices  # pylint: disable=wrong-import-position
 from hyper_parallel.distributed.expert_parallel import (  # pylint: disable=wrong-import-position
     routing as routing_module,
 )
@@ -65,10 +66,13 @@ class TestBalancedExpertIndices(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_spreads_slots_evenly_over_destination_ranks(self) -> None:
-        """Every destination rank gets the same slot count; experts differ by <=1."""
+        """Feature: fixed MoE routing.
+        Description: Every destination rank gets the same slot count; experts differ by <=1.
+        Expectation: Each destination receives equal load and expert spread is at most one.
+        """
         tokens, per_token, total, local = 10, 2, 8, 2
-        indices = ep_compute._balanced_expert_indices(  # pylint: disable=protected-access
-            tokens, per_token, total, local, device=torch.device("cpu"))
+        indices = fixed_expert_indices(
+            tokens, per_token, total, local_expert_count=local, device=torch.device("cpu"))
 
         self.assertEqual(tuple(indices.shape), (tokens, per_token))
         self.assertEqual(indices.dtype, torch.int64)
@@ -86,10 +90,12 @@ class TestBalancedExpertIndices(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_rejects_indivisible_expert_layout(self) -> None:
-        """A global expert count that does not split evenly fails fast."""
+        """Feature: fixed MoE routing.
+        Description: A global expert count that does not split evenly fails fast.
+        Expectation: An indivisible layout raises ValueError.
+        """
         with self.assertRaises(ValueError):
-            ep_compute._balanced_expert_indices(  # pylint: disable=protected-access
-                4, 1, 6, 4, device=torch.device("cpu"))
+            fixed_expert_indices(4, 1, 6, local_expert_count=4, device=torch.device("cpu"))
 
 
 class TestBalancedRouter(unittest.TestCase):
@@ -97,28 +103,28 @@ class TestBalancedRouter(unittest.TestCase):
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
-    def test_keeps_real_gate_weights_and_replaces_destinations(self) -> None:
-        """Gate weights stay differentiable; only the chosen experts are replaced."""
+    def test_gathers_real_gate_weights_for_replacement_destinations(self) -> None:
+        """Feature: fixed MoE routing.
+        Description: Weights and gradients follow the experts selected by the fixed assignment.
+        Expectation: Weights and gradients match the experts dispatched by the fixed plan.
+        """
         tokens, per_token, total, local = 6, 2, 8, 2
-        real_indices = torch.zeros(tokens, per_token, dtype=torch.int64)
-        real_weights = torch.arange(
-            tokens * per_token, dtype=torch.float32).view(tokens, per_token)
-
-        original = routing_module.MOE_ROUTER_ADAPTERS["deepseekv3"]
-        routing_module.MOE_ROUTER_ADAPTERS["deepseekv3"] = (
-            lambda module, hidden_states: (real_indices.clone(), real_weights)
-        )
-        try:
-            indices, weights = ep_compute._balanced_router(  # pylint: disable=protected-access
-                _FakeMoE(local, total), torch.zeros(1))
-        finally:
-            routing_module.MOE_ROUTER_ADAPTERS["deepseekv3"] = original
-
-        self.assertTrue(torch.equal(weights, real_weights))
-        self.assertFalse(torch.equal(indices, real_indices))
-        expected = ep_compute._balanced_expert_indices(  # pylint: disable=protected-access
-            tokens, per_token, total, local, device=indices.device)
-        self.assertTrue(torch.equal(indices.to(torch.int64), expected))
+        module = _FakeMoE(local, total)
+        module.gate = torch.nn.Linear(3, total, bias=False)
+        module.top_k = per_token
+        module.norm_topk_prob = True
+        module.routed_scaling_factor = 2.5
+        states = torch.randn(tokens, 3, requires_grad=True)
+        indices, weights = ep_compute._balanced_router(module, states)  # pylint: disable=protected-access
+        expected_indices = torch.tensor([[0, 2], [4, 6], [1, 3], [5, 7], [0, 2], [4, 6]])
+        scores = module.gate(states).float().sigmoid().gather(1, expected_indices)
+        reference = scores / (scores.sum(-1, keepdim=True) + 1e-20) * 2.5
+        torch.testing.assert_close(indices, expected_indices)
+        torch.testing.assert_close(weights, reference)
+        actual = torch.autograd.grad(weights.square().sum(), (states, module.gate.weight), retain_graph=True)
+        expected = torch.autograd.grad(reference.square().sum(), (states, module.gate.weight))
+        for gradient, target in zip(actual, expected):
+            torch.testing.assert_close(gradient, target)
 
 
 class TestFactorySwitch(unittest.TestCase):
@@ -127,7 +133,10 @@ class TestFactorySwitch(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_fix_router_selects_the_balanced_router(self) -> None:
-        """On by switch, off by default; the stub captures what was passed."""
+        """Feature: fixed MoE routing.
+        Description: On by switch, off by default; the stub captures what was passed.
+        Expectation: The switch selects the balanced adapter and the default selects the real adapter.
+        """
         captured = {}
         original = ep_compute.build_ep_compute
 
@@ -189,7 +198,10 @@ class TestOverlapAndCapacitySwitches(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_both_switches_default_off_and_are_forwarded(self) -> None:
-        """Off by default; on when asked for, as the recipe asks for the overlap."""
+        """Feature: fixed MoE routing.
+        Description: Off by default; on when asked for, as the recipe asks for the overlap.
+        Expectation: Overlap and capacity settings are forwarded without changing their defaults.
+        """
         default = self._capture()
         self.assertIsNone(default["overlap_fn"])
         self.assertIsNone(default["capacity_factor"])
@@ -201,11 +213,9 @@ class TestOverlapAndCapacitySwitches(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_combine_uses_the_overlapped_branch_when_it_is_given_one(self) -> None:
-        """The overlap is real only if ``combine`` consumes the precomputed branch.
-
-        Expectation: without the overlapped value ``combine`` evaluates
-            ``shared_experts`` itself; with it, that branch is used as is -- the
-            contract that lets the factory run it while the exchange is in flight.
+        """Feature: fixed MoE routing.
+        Description: The overlap is real only if ``combine`` consumes the precomputed branch.
+        Expectation: Combine consumes a supplied shared branch and otherwise computes it.
         """
         captured = self._capture(overlap_shared_expert=True)
         hidden = torch.randn(3, 4)

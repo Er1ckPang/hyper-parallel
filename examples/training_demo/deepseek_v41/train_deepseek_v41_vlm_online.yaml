@@ -21,6 +21,8 @@ model:
   # EP8/FSDP8 smoke: two local routed experts per rank, while preserving the released
   # top-k (6), routing, dispatch, and optimizer-sharding paths.
   num_routed_experts: 16
+  # Profiling only: true forces expert round robin with matching gate weights.
+  fix_router: false
   exercise_post_training_indexer: true
   indexer_loss_coeff: 0.001
   # Generic HyperAutoModel build options accepted by the builder.
