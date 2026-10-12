@@ -339,7 +339,7 @@ class JTDeepseekV3Attention(DeepseekV32Attention):
 
 
 class JTDeepseekV3Gate(DeepseekV32TopkRouter):
-    """HF router projection that keeps its logits for the sequence auxiliary loss."""
+    """HF router projection computing FP32 logits, kept for the sequence auxiliary loss."""
 
     def __init__(self, config: Any) -> None:
         """Create the HF router weight and expert bias.
@@ -351,12 +351,16 @@ class JTDeepseekV3Gate(DeepseekV32TopkRouter):
         self.router_logits = None
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Return the router logits, ``[tokens, num_experts]``, and keep them.
+        """Return the FP32 router logits, ``[tokens, num_experts]``, and keep them.
+
+        As in the HF router, the input and the weight are cast to FP32, so routing and the
+        auxiliary loss use FP32 logits instead of logits rounded to the BF16 activation dtype.
 
         Args:
             hidden_states: Router inputs, ``[..., hidden]``.
         """
-        self.router_logits = F.linear(hidden_states.reshape(-1, self.hidden_dim), self.weight)
+        hidden_states = hidden_states.reshape(-1, self.hidden_dim)
+        self.router_logits = F.linear(hidden_states.float(), self.weight.float())  # pylint: disable=not-callable
         return self.router_logits
 
     def pop_router_logits(self) -> torch.Tensor:

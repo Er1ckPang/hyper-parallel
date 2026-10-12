@@ -25,9 +25,10 @@ from torch.nn import functional as F
 
 from hyper_parallel.models.jt_deepseek_v3.modeling_jt_deepseek_v3 import (
     JTDeepseekV3Config,
-    JTDeepseekV3ForCausalLM, JTDeepseekV3Decoder, JTDeepseekV3MoE,
+    JTDeepseekV3ForCausalLM, JTDeepseekV3Decoder, JTDeepseekV3Gate, JTDeepseekV3MoE,
     JTDeepseekV3Attention, JTDeepseekV3MLAAttention,
 )
+from hyper_parallel.components.losses import calculate_seq_aux_loss
 from hyper_parallel.components.modules.mtp import MultiTokenPredictionLayer
 from hyper_parallel.data.batching import TextParallelBatch
 from hyper_parallel.distributed._builder.fsdp_adapter import FSDP2Manager
@@ -93,7 +94,9 @@ class TestCompleteModel(unittest.TestCase):
         """Feature: Framework BF16 policy.
 
         Description: Emulate FSDP param_dtype=bfloat16 compute copies over FP32 storage; buffers stay as stored.
-        Expectation: Activations stay BF16 without FSDP input casts; losses and the expert bias stay FP32.
+        Expectation: Activations stay BF16 without FSDP input casts; losses and the expert bias stay FP32. Trunk
+            and MTP router logits and auxiliary-loss scores are FP32, computed from the upcast BF16 router input
+            and BF16 weight copy.
         """
         model = JTDeepseekV3ForCausalLM(small_config())
         for parameter in model.parameters():
@@ -107,6 +110,7 @@ class TestCompleteModel(unittest.TestCase):
         self.assertTrue(all(bias.dtype == torch.float32 for bias in biases))
 
         activations = {}
+        routers = {}
 
         def capture(name: str) -> Any:
             """Record a selected module output by name."""
@@ -118,20 +122,45 @@ class TestCompleteModel(unittest.TestCase):
 
             return hook
 
+        def capture_router(name: str) -> Any:
+            """Record a router input and its logits by router name."""
+
+            def hook(_module: Any, inputs: Any, output: Any) -> None:
+                """Store the router input and the returned logits."""
+                routers[name] = (inputs[0], output)
+
+            return hook
+
+        gates = {name: module for name, module in model.named_modules() if isinstance(module, JTDeepseekV3Gate)}
         handles = [
             model.model.layers[0].self_attn.register_forward_hook(capture("attention")),
             model.model.layers[1].mlp.register_forward_hook(capture("moe")),
             model.model.layers[1].register_forward_hook(capture("decoder")),
+            *(gate.register_forward_hook(capture_router(name)) for name, gate in gates.items()),
         ]
         try:
             tokens = torch.arange(8).unsqueeze(0)
-            with torch.no_grad():
+            with torch.no_grad(), patch(f"{JTDeepseekV3Gate.__module__}.calculate_seq_aux_loss",
+                                        wraps=calculate_seq_aux_loss) as auxiliary_loss:
                 output = model(tokens, (tokens + 1) % 32)
         finally:
             for handle in handles:
                 handle.remove()
         self.assertEqual({value.dtype for value in activations.values()}, {torch.bfloat16})
         self.assertTrue(all(value.dtype == torch.float32 for value in output.loss.values()))
+        self.assertEqual(list(routers), ["model.layers.1.mlp.gate", "mtp.layers.0.transformer_layer.mlp.gate"])
+        scores = [call.args[0] for call in auxiliary_loss.call_args_list]
+        for (name, (router_input, logits)), router_scores in zip(routers.items(), scores, strict=True):
+            with self.subTest(router=name):
+                weight = gates[name].weight
+                self.assertEqual((router_input.dtype, weight.dtype), (torch.bfloat16, torch.bfloat16))
+                self.assertEqual(logits.dtype, torch.float32)
+                expected = F.linear(  # pylint: disable=not-callable
+                    router_input.reshape(-1, router_input.shape[-1]).float(), weight.float())
+                self.assertTrue(torch.equal(logits, expected), f"{name} logits differ from the FP32 product")
+                self.assertEqual(router_scores.dtype, torch.float32)
+                self.assertTrue(torch.equal(router_scores, logits.sigmoid()),
+                                f"{name} auxiliary-loss scores differ from the router logits")
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_replacement_selects_attention(self):
