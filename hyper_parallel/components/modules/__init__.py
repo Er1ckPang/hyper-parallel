@@ -33,6 +33,9 @@ if TYPE_CHECKING:
     from hyper_parallel.components.modules.rms_norm import OffsetRMSNorm, RMSNorm
     from hyper_parallel.components.modules.shared_expert import SharedExpert
     from hyper_parallel.components.modules.swiglu_mlp import SwiGLUMLP
+    from hyper_parallel.components.modules.terrace_router import (
+        TerraceRouteConfig, TerraceRouter, terrace_route, terrace_select,
+    )
 
 _EXPORT_TO_MODULE = {
     "DeepseekV32DSAAttention": "dsa_attention",
@@ -58,6 +61,10 @@ _EXPORT_TO_MODULE = {
     "SharedCompressedDSAAttention": "shared_compressed_dsa_attention",
     "SharedCompressedDSAIndexer": "shared_compressed_dsa_attention",
     "SwiGLUMLP": "swiglu_mlp",
+    "TerraceRouteConfig": "terrace_router",
+    "TerraceRouter": "terrace_router",
+    "terrace_route": "terrace_router",
+    "terrace_select": "terrace_router",
 }
 __all__.extend(_EXPORT_TO_MODULE)
 

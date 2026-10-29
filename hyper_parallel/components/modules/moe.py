@@ -38,9 +38,10 @@ __all__ = [
 import math
 from typing import Any
 
-import torch
-import torch.nn.functional as F
-from torch import nn
+import torch  # pylint: disable=forbidden-backend-import
+import torch.distributed as dist  # pylint: disable=forbidden-backend-import
+import torch.nn.functional as F  # pylint: disable=forbidden-backend-import
+from torch import nn  # pylint: disable=forbidden-backend-import
 
 from hyper_parallel.components.functional.npu_grouped_swiglu import npu_grouped_swiglu
 from hyper_parallel.core.dtensor.dtensor import DTensor
@@ -429,6 +430,23 @@ class TokenChoiceTopKRouter(nn.Module):
         if self.route_scale != 1.0:
             scores = scores * self.route_scale
 
+        return self.select_experts(scores, expert_bias)
+
+    def select_experts(
+        self, scores: torch.Tensor, expert_bias: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Select experts from precomputed affinities using the native top-k path.
+
+        Args:
+            scores: Affinities shaped ``[num_tokens, num_experts]``. Callers
+                own the projection, score function and normalization policy.
+            expert_bias: Optional selection-only load-balancing bias.
+
+        Returns:
+            Unnormalized unbiased scores, expert IDs and local expert counts.
+        """
+        if scores.ndim != 2 or scores.shape[1] != self.num_experts:
+            raise ValueError("scores must have shape [num_tokens, num_experts]")
         # Node-limited routing — mask out low-scoring expert groups.
         scores_for_topk = scores
         if self.num_expert_groups is not None:
@@ -516,8 +534,6 @@ def _compute_load_balance_loss(
     Returns:
         Scalar loss tensor. Returns 0.0 for empty input.
     """
-    import torch.distributed as dist  # pylint: disable=C0415
-
     num_tokens, top_k = top_scores.shape
 
     if num_tokens == 0:

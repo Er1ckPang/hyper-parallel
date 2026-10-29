@@ -16,6 +16,7 @@
 
 from typing import Any
 
+import torch  # pylint: disable=forbidden-backend-import
 
 _NPU_GROUPED_MATMUL = None
 
@@ -26,7 +27,6 @@ def _get_npu_grouped_matmul() -> Any:
     if _NPU_GROUPED_MATMUL is not None:
         return _NPU_GROUPED_MATMUL
 
-    import torch  # pylint: disable=C0415
     import torch_npu  # pylint: disable=C0415
 
     class _NPUGroupedMatmul(torch.autograd.Function):  # pylint: disable=abstract-method
@@ -34,7 +34,17 @@ def _get_npu_grouped_matmul() -> Any:
 
         @staticmethod
         def forward(ctx: Any, inputs: Any, weight: Any, group_list: Any) -> Any:
-            """Run one grouped matrix multiplication and retain backward inputs."""
+            """Run one grouped matrix multiplication and retain backward inputs.
+
+            Args:
+                ctx: Autograd context used to retain tensors for backward.
+                inputs: Expert-major input matrix.
+                weight: Batched expert projection matrices.
+                group_list: Cumulative token counts delimiting each expert.
+
+            Returns:
+                Expert-major matrix of projected token states.
+            """
             ctx.save_for_backward(inputs, weight, group_list)
             return torch_npu.npu_grouped_matmul(
                 x=[inputs],
@@ -48,7 +58,15 @@ def _get_npu_grouped_matmul() -> Any:
 
         @staticmethod
         def backward(ctx: Any, grad_output: Any) -> tuple[Any, Any, None]:
-            """Compute grouped input and weight gradients."""
+            """Compute grouped input and weight gradients.
+
+            Args:
+                ctx: Autograd context containing the forward tensors.
+                grad_output: Gradient of the expert-major output matrix.
+
+            Returns:
+                Input and weight gradients, with no gradient for group_list.
+            """
             inputs, weight, group_list = ctx.saved_tensors
             grad_output = grad_output.contiguous()
             grad_inputs = torch_npu.npu_grouped_matmul(
@@ -88,6 +106,7 @@ def npu_grouped_swiglu(
     gate_up_weight: Any,
     down_weight: Any,
     tokens_per_expert: Any,
+    routing_weights: Any = None,
 ) -> Any:
     """Run packed local SwiGLU experts with two grouped GEMMs.
 
@@ -96,6 +115,9 @@ def npu_grouped_swiglu(
         gate_up_weight: Packed projection weights with shape ``[E, 2I, H]``.
         down_weight: Down projection weights with shape ``[E, H, I]``.
         tokens_per_expert: Token count for each local expert, shape ``[E]``.
+        routing_weights: Optional expert-major weights shaped ``[T]``. Apply
+            them before the down projection, preserving a source model's
+            BF16 rounding convention. Omitted weights preserve the default.
 
     Returns:
         Expert-major output with shape ``[T, H]``.
@@ -110,7 +132,6 @@ def npu_grouped_swiglu(
     if gate_up_weight.shape[0] != tokens_per_expert.numel():
         raise ValueError("tokens_per_expert must contain one count per local expert")
 
-    import torch  # pylint: disable=C0415
     import torch_npu  # pylint: disable=C0415
 
     grouped_matmul = _get_npu_grouped_matmul()
@@ -121,6 +142,10 @@ def npu_grouped_swiglu(
         group_list,
     )
     intermediate = torch_npu.npu_swiglu(gate_up, dim=-1)
+    if routing_weights is not None:
+        if routing_weights.shape != (inputs.shape[0],) or routing_weights.device != inputs.device:
+            raise ValueError("routing_weights must match the routed token rows and device")
+        intermediate = (intermediate * routing_weights.unsqueeze(-1)).to(inputs.dtype)
     return grouped_matmul.apply(
         intermediate,
         down_weight.transpose(1, 2),
