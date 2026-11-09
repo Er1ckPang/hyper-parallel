@@ -247,6 +247,8 @@ class BaseTrainer(Stateful, ABC):
     optimizer = None
     lr_scheduler: LRScheduler = None
     loss_fn: Optional[torch.nn.Module] = None
+    loss_aggregation: str = "token_weighted"
+    step_micro_batches: int = 0
 
     # Training context
     model_fwd_context: Any
@@ -322,6 +324,7 @@ class BaseTrainer(Stateful, ABC):
 
     def _setup(self):
         """Initialize logging, distributed state, and the local device."""
+        self.loss_aggregation = self.config.training.loss_aggregation
         # log args
         setup_logging()
 
@@ -809,6 +812,7 @@ class BaseTrainer(Stateful, ABC):
             local_loss,
             current_token_counts,
             device_mesh=self.mesh,
+            loss_aggregation=self.loss_aggregation,
         )
         loss = torch.stack(list(loss_dict.values())).sum()
         # Model-declared extra metrics join the logged mapping only after
@@ -847,6 +851,7 @@ class BaseTrainer(Stateful, ABC):
         """
         for name, count in self.current_token_counts.items():
             self.step_token_counts[name] = self.step_token_counts.get(name, 0) + count.detach()
+        self.step_micro_batches += 1
         channel_loss_callback = getattr(self, "channel_loss_callback", None)
         micro_step_context = (
             channel_loss_callback.micro_step_context(self.state, micro_batch)
@@ -982,16 +987,21 @@ class BaseTrainer(Stateful, ABC):
     def begin_loss_step(self) -> None:
         """Reset scalar counters before reading the next optimizer step."""
         self.step_token_counts = {}
+        self.step_micro_batches = 0
 
     def _loss_denominator(self) -> float:
-        """Return the optimizer-step valid-token count across DP/CP."""
+        """Return the step's valid-token count or equally weighted DP microbatch count."""
         family = self.loss_names[0].split("_loss", maxsplit=1)[0]
-        count = self.step_token_counts[f"{family}_tokens"].detach().clone()
+        rank_average = self.loss_aggregation == "rank_average"
+        count = (torch.tensor(self.step_micro_batches, device=self.device)
+                 if rank_average else self.step_token_counts[f"{family}_tokens"].detach().clone())
         mesh = self.mesh.dp_cp_mesh
         if mesh is not None and mesh.size() > 1:
             count = all_reduce(count.to(self.device), op="sum", group=mesh.get_group())
         else:
             count = count.item()
+        if rank_average:
+            count /= self.mesh.cp_size
         return max(count, 1)
 
     @torch.no_grad()

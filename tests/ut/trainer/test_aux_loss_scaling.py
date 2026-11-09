@@ -58,6 +58,50 @@ class AuxiliaryModel(nn.Module):
 class TestTrainerAuxLossScaling(unittest.TestCase):
     """Exercise the actual BaseTrainer microstep and loss aggregation."""
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
+    def test_rank_average_matches_equal_microbatch_objective(self) -> None:
+        """Match equal microbatch weights for independent main, MTP and auxiliary branches.
+
+        Feature: Rank-average training objective.
+        Description: Accumulate two microbatches with unequal valid-token counts.
+        Expectation: Actual gradients match an explicitly averaged objective, including both AUX branches.
+        """
+        trainer = BaseTrainer.__new__(BaseTrainer)
+        trainer.device = torch.device("cpu")
+        trainer.model = AuxiliaryModel(True, True)
+        trainer.loss_aggregation = "rank_average"
+        trainer.model_fwd_context = nullcontext()
+        trainer.model_bwd_context = nullcontext()
+        trainer.graph_compiler = None
+        trainer.model_integration = Mock()
+        trainer.config = SimpleNamespace(training=SimpleNamespace(empty_cache_before_backward=False))
+        trainer.mesh = SimpleNamespace(dp_cp_mesh=None, sequence_parallel=False, dp_size=1, cp_size=1)
+        trainer.loss_fn = lambda model_output, labels: model_output
+        trainer.begin_loss_step()
+        metrics = {}
+        total_loss = 0.0
+        for tokens, value in ((1, 1.0), (3, 2.0)):
+            trainer.current_token_counts = {"foundation_tokens": torch.tensor(tokens)}
+            loss, losses = trainer.forward_backward_step({"input_ids": torch.tensor([value])})
+            total_loss += loss.item()
+            for name, numerator in losses.items():
+                metrics[name] = metrics.get(name, 0.0) + numerator.item()
+        self.assertEqual(trainer.loss_normalize(total_loss, metrics), 9.0)
+        self.assertEqual(metrics, {"foundation_loss": 6.0, "foundation_loss_mtp": 3.0})
+        reference = AuxiliaryModel(True, True)
+        objective = sum(value * (reference.main.square() + reference.main
+                                 + reference.router.square() + reference.indexer.square())
+                        for value in (1.0, 2.0)) / 2
+        objective.backward()
+        for actual, expected in zip(trainer.model.parameters(), reference.parameters()):
+            torch.testing.assert_close(actual.grad, expected.grad)
+        trainer.begin_loss_step()
+        self.assertEqual(trainer.step_micro_batches, 0)
+
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
     def test_unequal_microbatches_match_weighted_explicit_objective(self) -> None:
         """
         Feature: Auxiliary-loss training lifecycle.

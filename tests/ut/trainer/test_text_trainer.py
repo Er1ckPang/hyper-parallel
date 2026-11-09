@@ -79,6 +79,30 @@ class TestTextTrainer(unittest.TestCase):
                     torch.testing.assert_close(loss, torch.zeros_like(loss))
                     torch.testing.assert_close(logits.grad, torch.zeros_like(logits.grad))
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
+    def test_construction_initializes_configured_loss_aggregation(self) -> None:
+        """Feature: Text Trainer shared setup.
+
+        Description: Construct through the composition path that bypasses BaseTrainer.__init__.
+        Expectation: Both aggregation modes reach runtime before distributed setup.
+        """
+        for mode in ("token_weighted", "rank_average"):
+            with self.subTest(mode=mode):
+                trainer = TextTrainer.__new__(TextTrainer)
+                config = SimpleNamespace(training=SimpleNamespace(loss_aggregation=mode, backend="gloo"))
+                with patch.object(TextTrainer, "__new__", return_value=trainer), \
+                        patch("hyper_parallel.trainer.base.setup_logging"), \
+                        patch("hyper_parallel.trainer.base.initialize_distributed",
+                              side_effect=RuntimeError("stop before distributed setup")):
+                    with self.assertRaisesRegex(RuntimeError, "stop before distributed setup"):
+                        TextTrainer(config)
+                self.assertEqual(trainer.base.loss_aggregation, mode,
+                                 f"expected aggregation={mode}, got={trainer.base.loss_aggregation}")
+
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
     def test_template_logging_is_independent_of_dataset_debug(self) -> None:
         """Feature: Independent template debug configuration.
 

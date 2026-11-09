@@ -19,7 +19,7 @@ from __future__ import annotations
 
 __all__ = ["mean_global_loss"]
 
-from typing import TYPE_CHECKING, Union
+from typing import TYPE_CHECKING, Literal, Union
 
 import torch
 import torch.distributed as dist
@@ -53,32 +53,37 @@ def mean_global_loss(
     losses: Union[dict[str, torch.Tensor], torch.Tensor],
     current_token_counts: dict[str, torch.Tensor],
     device_mesh: "MeshContext",
+    loss_aggregation: Literal["token_weighted", "rank_average"] = "token_weighted",
 ) -> dict[str, torch.Tensor]:
     """Calculate global loss numerators using explicit mesh information.
 
-    FSDP divides gradients over its flattened DP+CP domain, so each local loss
-    is weighted by valid tokens and multiplied by ``dp_size * cp_size``.
-    Trainer divides accumulated gradients and reported losses by the actual
-    optimizer-step token count afterwards. Empty shards must return finite losses.
+    Token weighting sums valid-token numerators. Rank averaging first joins CP
+    shards, then gives DP microbatches equal weight. Both compensate FSDP's
+    DP+CP gradient average; Trainer divides by the corresponding step weight.
+    Empty shards must return finite losses.
 
     Args:
         losses: A loss tensor or mapping of named loss tensors.
         current_token_counts: Token counts for the current micro batch.
         device_mesh: Trainer mesh context containing parallel sizes and groups.
+        loss_aggregation: Token-weighted steps or equally weighted DP microbatch means.
 
     Returns:
-        Token-weighted loss numerators keyed by loss name.
+        Loss numerators keyed by loss name.
 
     Raises:
-        ValueError: If sequence parallelism is enabled without a TP device mesh.
+        ValueError: If the aggregation mode, TP mesh or loss families are unsupported.
     """
     loss_dict = {}
+    if loss_aggregation not in ("token_weighted", "rank_average"):
+        raise ValueError(f"Unknown loss aggregation: {loss_aggregation!r}")
+    token_weighted = loss_aggregation == "token_weighted"
     dp_cp_mesh = device_mesh.dp_cp_mesh
     dp_cp_group = dp_cp_mesh.get_group() if dp_cp_mesh is not None else None
-    sequence_parallel = device_mesh.sequence_parallel
+    reduce_tp_counts = device_mesh.sequence_parallel and token_weighted
     sequence_parallel_group = None
     sequence_parallel_size = 1
-    if sequence_parallel:
+    if reduce_tp_counts:
         if device_mesh.device_mesh is None or "tp" not in device_mesh.device_mesh.mesh_dim_names:
             raise ValueError("Sequence parallelism requires a DeviceMesh with a 'tp' dimension.")
         sequence_parallel_group = device_mesh.device_mesh["tp"].get_group()
@@ -94,7 +99,7 @@ def mean_global_loss(
         loss_name = key.split("_loss", maxsplit=1)[0]  # foundation/image_decoder/**
 
         cur_token_len = current_token_counts[f"{loss_name}_tokens"]
-        if sequence_parallel:
+        if reduce_tp_counts:
             if _is_tracing_or_compiling():
                 # Graph tracing: ``.item()`` is data-dependent and unsupported
                 # by the static-shape tracer; aggregate on tensors instead.
@@ -103,6 +108,15 @@ def mean_global_loss(
                 )
             else:
                 cur_token_len = all_reduce(cur_token_len.item(), op="sum", group=sequence_parallel_group)
+
+        if not token_weighted:
+            count = torch.as_tensor(cur_token_len, device=cur_loss.device, dtype=torch.float32)
+            total = count
+            if device_mesh.cp_size > 1:
+                total = differentiable_all_reduce(count, "sum", device_mesh.cp_mesh.get_group())
+            # CP shards form one microbatch; empty microbatches still carry
+            # independently injected auxiliary objectives.
+            cur_token_len = torch.where(total > 0, count / total.clamp_min(1), 1.0 / device_mesh.cp_size)
 
         if _is_tracing_or_compiling():
             # Graph-traced variant of the aggregation below: identical math
@@ -119,7 +133,7 @@ def mean_global_loss(
                     global_weighted_loss, "sum", dp_cp_group
                 )
             cur_loss = global_weighted_loss + (backward_loss - backward_loss.detach())
-            if sequence_parallel:
+            if reduce_tp_counts:
                 cur_loss = cur_loss / sequence_parallel_size
             loss_dict[key] = cur_loss
             continue
@@ -131,7 +145,7 @@ def mean_global_loss(
             dp_cp_group,
         )
 
-        if sequence_parallel:
+        if reduce_tp_counts:
             cur_loss = cur_loss / sequence_parallel_size
 
         loss_dict[key] = cur_loss
