@@ -126,6 +126,8 @@ _FAMILY_DIR_ALIASES = {
     # registered from ``models/kimi_k26/``.
     "kimik25": "kimi_k26",
     "qwen35moetext": "qwen3_5_moe",
+    # Official model_type xing4_0 is served by the Xing4 adapter directory.
+    "xing40": "xing_4",
 }
 
 # A provider directory normally does not rename the copied upstream modeling

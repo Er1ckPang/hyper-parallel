@@ -1,0 +1,378 @@
+# Xing4实测配方：默认单卡；FSDP8按下述字段注释和README的原生CLI覆盖。
+# 两种场景均为1 Dense +1 MoE主干、1 MTP；仅batch、FSDP分片与重计算策略不同。
+# 唯一模型/训练参数依据：https://gitcode.com/xuxinglei/mindformers-private/issues/12
+# 与原 YAML 的明确差异：最小减层、GBS=2/LBS=1、训练到 2500 步；保留原 7500 步 LR 日程。
+# 已确认的实验设置：4096、MLA、融合 mHC；两侧 clamp 与 CMHC 均关闭。
+# HP 使用仓内未修改的 HF Xing4 源码，不需要启动时下载模型，也不加载 HF 发布权重。
+# 同一模型配方支持从头训练、续训 HP、续训 MF；只改变 checkpoint.restore_from，见下方注释。
+# 启动：torchrun --standalone --nproc_per_node=1 -m examples.training_demo.train_text \
+#   examples/training_demo/xing4/train_single.yaml
+# 按自己的 YAML 配置模型、数据和并行；MF 先离线转换，HP 原生 checkpoint 直接恢复。
+# 单卡和FSDP8均使用本文件；实测参数、配置含义和原生启动命令见README.md。
+
+model:
+  # HP 模型构建入口：复用 HF 主干并绑定 CP 目标、TP/LP AUX 系数，不能换成通用 from_config。
+  _target_: hyper_parallel.models.xing_4.modeling_xing4_0.build_model # HF主干加框架模块替换与并行计划。
+  config:
+    vocab_size: 131072                   # MF model.vocab_size；词表行数，改变后 checkpoint 形状也改变。
+    actual_vocab_size: 131072            # 同上；无额外词表 padding，记录训练词表口径。
+    hidden_size: 3584                    # MF model.hidden_size；主干宽度，减层时保持不变。
+    intermediate_size: 9216              # MF model.intermediate_size；Dense SwiGLU 中间宽度。
+    num_hidden_layers: 2                 # MF 同名字段；原值 40，本文件仅保留两层主干。
+    first_k_dense_replace: 1             # MF 同名字段；原值 2，当前第 0 层 Dense、第 1 层 MoE。
+    num_nextn_predict_layers: 1          # MF 同名字段；MTP 深度，独立于上述主干层数。
+    mtp_loss_factor: 0.1                 # MF mtp_loss_scaling_factor；按深度均值缩放 MTP CE。
+    num_attention_heads: 32              # MF 同名字段；MLA 头数，TP/CP 的头划分必须整除。
+    num_key_value_heads: 32              # HF KV 头元数据；本配方 MLA 每头展开，不启用额外 GQA。
+    max_position_embeddings: 32768       # MF 同名字段；YaRN 原始位置范围，不是本轮输入长度。
+    seq_length: 4096                    # MF model.seq_length；须与 dataset.data_config.seq_length 同步。
+    hidden_act: silu                     # MF fusedswiglu 的数学语义；融合由下方 SwiGLUMLP 替换选择。
+    gated_linear_unit: true              # MF 同名字段；保留 gate/up 相乘的 SwiGLU 结构。
+    initializer_range: 0.02              # MF 同名字段；初始化标准差，完整 checkpoint 恢复后由状态覆盖。
+    rms_norm_eps: 1.0e-6                 # MF 同名字段；残差流及 MTP RMSNorm epsilon。
+    attention_dropout: 0.0              # MF 同名字段；当前融合 MLA 路径要求为零。
+    hidden_dropout: 0.0                 # MF 同名字段；原配方无隐藏态 dropout。
+    add_bias_linear: false               # MF 同名字段；固定无 bias 的投影结构，不是通用开关。
+    tie_word_embeddings: false           # MF 独立 embedding/output_layer；不共享两份权重。
+    use_cache: false                     # 训练关闭 KV cache，不能用推理缓存替代完整序列训练。
+
+    # MLA：保持 MF 的 latent 维度、QKV 拼接布局与每头 RoPE/no-RoPE 通道。
+    multi_latent_attention: true         # MF 同名字段；本接入固定 MLA，不实现 DSA/indexer。
+    experimental_attention_variant: null # MF 同名字段；不启用 DSA，不能只改此项切换注意力。
+    mla_qkv_concat: true                 # MF 同名字段；融合 Q/KV 下投影，亦为逻辑 Muon 布局前提。
+    kv_lora_rank: 512                    # MF 同名字段；KV 压缩维度。
+    q_lora_rank: 768                     # MF 同名字段；Q 压缩维度，勿直接使用 HF 默认的 1536。
+    qk_nope_head_dim: 128                # MF 同名字段；每头非旋转 Q/K 通道。
+    qk_rope_head_dim: 64                 # MF 同名字段；每头旋转 Q/K 通道。
+    v_head_dim: 128                      # MF 同名字段；每头 V 通道。
+    qk_layernorm: true                   # MF 同名字段；潜变量 RMSNorm 在接入中保留。
+    use_flash_attention: true            # MF 同名字段；接入实际调用框架融合 MLA/FA，不提供非融合分支。
+    use_eod_attn_mask_compression: true   # MF 元数据；本例逐条独立样本，不据此新增 packed/EOD 隔离边界。
+    rope_interleave: true                # MF 融合 RoPE 的交错布局；改变布局须同步变换权重。
+    apply_rope_fusion: true              # MF 同名字段；使用框架交错融合 RoPE。
+    position_embedding_type: yarn       # MF 同名字段；具体 YaRN 参数由 rope_parameters 提供。
+    rope_theta: 100000.0                 # MF 同名字段；RoPE 频率基数。
+    rotary_scaling_factor: 16.0          # MF 同名字段；对应下面 factor，保留原日程/长度语义。
+    beta_fast: 32                       # MF 同名字段；YaRN 高频修正边界。
+    beta_slow: 1                        # MF 同名字段；YaRN 低频修正边界。
+    mscale: 1                           # MF 同名字段；YaRN 幅度参数。
+    mscale_all_dim: 1                   # MF 同名字段；参与 MLA 注意力缩放。
+    rope_parameters:
+      rope_type: yarn                   # HF YaRN 实现选择；对应 MF position_embedding_type。
+      rope_theta: 100000.0              # MF rope_theta；与顶层保持相同。
+      factor: 16.0                      # MF rotary_scaling_factor。
+      original_max_position_embeddings: 32768 # MF max_position_embeddings 的原始训练位置范围。
+      beta_fast: 32                     # MF beta_fast。
+      beta_slow: 1                      # MF beta_slow。
+      mscale: 1                         # MF mscale。
+      mscale_all_dim: 1                 # MF mscale_all_dim。
+
+    # mHC：主干和 MTP 均保留四条残差流，使用融合算子；CMHC、HC head、clamp 不启用。
+    enable_hyper_connections: true      # MF 同名字段；本模型固定保留 mHC 结构。
+    hc_mult: 4                         # MF num_residual_streams；残差流数。
+    hc_sinkhorn_iters: 20              # MF mhc_sinkhorn_iterations；Sinkhorn 迭代数。
+    mhc_init_gating_factor: 0.01        # MF 同名字段；mHC 门控缩放的初始化值。
+    mhc_layernorm_epsilon: 1.0e-6       # MF mHC 归一化 epsilon；融合 pre 使用该值。
+    use_fused_mhc: true                 # MF 同名字段；本接入支持的融合 mHC 路径。
+    mtp_enable_hyper_connections: true  # MF 同名语义；MTP decoder 也使用 mHC。
+    enable_cmhc: false                 # MF 同名字段；当前不支持 CMHC，保持关闭。
+    enable_hc_head: false              # MF 同名字段；末端按流均值合并，不增加 HC head。
+    mhc_h_res_clamp_min: null          # MF hc_sinkhorn_clamp 的下界；已授权两侧均不 clamp。
+    mhc_h_res_clamp_max: null          # MF hc_sinkhorn_clamp 的上界；不能设回 HF 默认的 30。
+
+    # MoE：原 64 专家、top-4、1 共享专家；不插入 safe token，空专家交由框架处理。
+    n_routed_experts: 64               # MF 同名字段；路由专家总数，须能被 EP 整除。
+    num_experts_per_tok: 4             # MF 同名字段；每个 token 激活的路由专家数。
+    moe_intermediate_size: 1024        # MF 同名字段；单个路由专家 SwiGLU 宽度。
+    n_shared_experts: 1                # MF 同名字段；始终计算的共享专家数。
+    moe_shared_expert_intermediate_size: 1024 # MF 同名字段；本例等于 n_shared_experts×moe_intermediate_size。
+    routed_scaling_factor: 2.0         # MF 同名字段；归一化 top-k 权重后的输出缩放。
+    norm_topk_prob: true               # MF 同名字段；对选中专家的 sigmoid 权重归一化。
+    scoring_func: sigmoid              # MF 同名字段；接入固定 sigmoid affinities。
+    n_group: 0                        # MF 同名字段；0 表示不做分组限制。
+    topk_group: 0                     # MF 同名字段；与 n_group=0 配套。
+    router_jitter_noise: 0.0           # MF 同名语义；映射 moe_input_jitter_eps，基线无路由噪声。
+    moe_router_load_balancing_type: seq_aux_loss # MF 同名字段；接入固定按完整序列计算 AUX。
+    moe_aux_loss_coeff: 0.0005         # MF 同名字段；训练 AUX 系数，勿把 raw AUX 当成加权值。
+    moe_router_enable_expert_bias: true # MF 同名字段；学习路由的选路偏置按负载更新。
+    moe_router_bias_update_rate: 0.0001 # MF 同名字段；每优化步偏置更新幅度，重计算不重复累计。
+    moe_grouped_gemm: true              # MF 同名字段；接入复用框架 GroupedExperts/GMM。
+    moe_permute_fusion: true            # MF 同名字段；真实 dispatch 使用框架融合排列/还原。
+    moe_token_dispatcher_type: alltoall # MF 同名字段；EP 跨卡分发由框架 executor 处理。
+    moe_token_drop_policy: false        # MF 同名字段；基线不丢弃超额 token。
+    moe_router_force_expert_balance: false # MF 同名字段；强制重选并重算权重/AUX，精度对齐必须关闭。
+    moe_n_hash_layers: 0                # MF 同名语义；本基线无 hash，不能把学习路由结果外推为 hash 验收。
+    # moe_n_hash_layers: 2              # 可选 hash 实验：前 N 个主干层中实际 MoE 用 tid2eid，不含 MTP。
+    # 本文件第 0 层 Dense，所以设 1 不会开启 hash，设 2 才覆盖第 1 层 MoE。
+    # fresh 表仅为 (token_id+slot)%专家数；训练过的表须从完整 checkpoint 恢复，两侧同表再做新基线。
+    # hash、强制均衡和 fix_router 分别改变不同语义；不同时打开，不能复用当前精度结论。
+
+    # 精度：算子内累加类型与参数存储类型分开；具体参数例外见 fsdp_config.mix_precision。
+    params_dtype: bfloat16              # MF params_dtype；常规模型参数最终存储 BF16。
+    compute_dtype: bfloat16             # MF compute_dtype；包括 embedding 送入主干时的转换。
+    layernorm_compute_dtype: float32    # MF 同名字段；RMSNorm 内部统计/累加精度。
+    softmax_compute_dtype: float32      # MF 同名字段；注意力融合内核负责 softmax 精度。
+    rotary_dtype: float32               # MF 同名字段；旋转通道采用 FP32 计算后回到计算类型。
+    router_dense_type: float32          # MF 同名字段；router 线性与统计用 FP32。
+    mhc_compute_dtype: bfloat16         # MF 同名字段；mHC 输入类型，融合算子内部策略由实现决定。
+    fp32_residual_connection: true      # MF 同名字段；残差流保留 FP32。
+    swiglu_limit: null                  # MF 未启用的上界；当前 SwiGLU 仅支持默认空策略。
+    swiglu_compute_dtype: null          # MF 未启用的额外策略；不自行加入特制算术。
+    chunk_loss_size: 512                # MF chunk_loss_num=8 在 S4096 下对应 512 token/chunk；不是 TP CE 实现。
+
+model_init_dtype: float32               # 常驻浮点状态为 FP32（含 router bias）；FSDP 计算精度见下方。
+
+training:
+  backend: hccl                        # MF Ascend 通信；单卡也使用同一训练入口。
+  train_iters: 2500                    # MF training.steps；绝对完成步数，恢复 1500 后还训练 1000 步。
+  lr_scheduler_iters: 7500             # MF lr_scheduler.total_steps；短跑只提前停止，不能压缩学习率日程。
+  global_batch_size: 2                 # MF training.global_batch_size；单卡实测2，FSDP8实测覆盖为8。
+  micro_batch_size: 1                  # MF local_batch_size；两场景均1，单卡GA2，FSDP8的DP8/GA1。
+  loss_aggregation: rank_average       # MF 微批等权目标；须带上配套 Trainer 修复，模型 PR 单独不使此字段生效。
+  max_grad_norm: 1.0                   # MF training.max_norm；归一化后按全局梯度范数裁剪。
+  seed: 1234                          # MF training.seed；同 seed 不代表模型/优化器/RNG 状态相同。
+  enable_full_determinism: false        # MF training.deterministic；保持基线 False。
+  logging_steps: 1                    # MF MFLossMonitor.per_print_times；每个优化步输出真实标量。
+  # enable_full_determinism: true       # 仅作单独对照；框架 deterministic algorithms 为 warn_only，不保证逐位相同。
+  # log_tflops: true                   # 可选解析 FLOPs 估计；不是实测硬件利用率，统计包含输入 padding token。
+  # gc_steps: 100                      # 可选 Python GC 周期；无 MF 数学参数对应，不纳入默认性能测量。
+  # empty_cache_steps: 100             # 可选释放 allocator 缓存；不释放活跃张量，频繁调用可能减速。
+  # empty_cache_before_backward: false # 不改变反向前的缓存策略；避免把 allocator reserved 当作活跃显存。
+
+accelerator:
+  tp_size: 1                          # MF tensor_parallel；单卡及纯FSDP8实测均1，不切注意力/词表。
+  cp_size: 1                          # MF context_parallel；两场景均1，每个rank处理完整4096序列。
+  ep_size: 1                          # MF expert_parallel；两场景均1，专家由FSDP存储分片，不做EP分发。
+  pp_size: 1                          # MF parallelism.pipeline_parallel；本配方不评估 PP。
+  sequence_parallel: false            # MF parallelism.sequence_parallel；本任务 TP>1 时随 TP 一起开启。
+  loss_parallel: false                # MF parallelism.enable_loss_parallel；TP>1 时用 True，避免收集全词表 logits。
+
+fsdp_config:
+  dp_shard_size: 1                    # 单卡实测1；FSDP8实测覆盖8，参数/梯度/optimizer状态按DP8分片。
+  edp_shard_size: 1                   # 单卡实测1；FSDP8覆盖8；EP=1沿用DP域，不表示专家并行卡数。
+  reshard_after_forward: true         # MF reshard_after_forward_policy=always；前向后释放完整参数。
+  reshard_after_backward: true        # MF optim_grads_params 的反向后重新分片语义。
+  requires_grad_sync: true            # 保留框架梯度同步；累积期的同步时机由 Trainer 管理。
+  mix_precision:
+    param_dtype: bfloat16             # MF model.params_dtype；常规参数按 BF16 参与计算。
+    reduce_dtype: float32             # MF 梯度 FP32 规约；fp32_main_params 的必要配套。
+    cast_forward_inputs: false        # 不全局强转入口，保留模型显式的 FP32 残差/RoPE 路径。
+    custom_params:
+      '*.attn_hc.*': {param_dtype: float32} # MF mHC 参数保留 FP32，不能随普通权重转成 BF16。
+      '*.ffn_hc.*': {param_dtype: float32}  # 同上，FFN mHC。
+      '*.mlp.gate.weight': {param_dtype: float32} # MF moe_router_params_dtype。
+      mtp.layers.*.enorm.weight: {param_dtype: float32} # MF MTP embedding norm 参数。
+      mtp.layers.*.hnorm.weight: {param_dtype: float32} # MF MTP hidden norm 参数。
+      mtp.layers.*.post_norm.weight: {param_dtype: float32} # MF MTP decoder 后归一化参数。
+  # forward_prefetch_depth: 1          # 默认预取深度；可改 0 单独评估通信重叠与峰值显存的取舍。
+  # backward_prefetch_depth: 1         # 同上；性能对照时两侧固定，不把预取额外缓存误判成泄漏。
+  # enable_offload: false              # MF parallelism.cpu_offload；本基线不卸载参数/梯度到 CPU。
+
+activation_checkpoint:
+  mode: full                         # 单卡实测full；FSDP8实测为'off'，selection恢复默认{}。
+  selection:
+    source: model_adapter_safe_regions # 单卡按模型安全区域重算；FSDP8整项selection={}且mode='off'。
+    layer_indices: [0, 1]             # MF full_recompute_layer 的零基主干层；MTP 在展平顺序中是 2，未选中。
+  # mode: 'off'                       # 关闭重计算；fresh/HP 续训/MF 续训使用同一个开关。
+  # 部分重计算：将 layer_indices 改为 [1]，仅覆盖 MoE 主干；不要和 layer_count 同时设置。
+  # swap_inputs: false                # 可选重计算输入卸载；改变通信/内存代价，另做独立性能实验。
+# activation_swap: none               # 默认不卸载注意力激活；与 activation_checkpoint 不同，不混入基线。
+
+optimizer:
+  _target_: hyper_parallel.models.xing_4.adapter.optim.build_optimizer # 框架 Muon，仅适配逻辑矩阵与 QK 裁剪。
+  fp32_main_params: true              # MF BF16 参数对应 FP32 主权重；恢复时核验主权重和模型别名。
+  muon_layout: mindformers_pynative    # 对应 MF 当前 MLA/MLP 逻辑矩阵分块；不是另写 Muon 更新算法。
+  qk_clip_threshold: 100              # MF qk_clip_enabled=True、qk_clip_threshold=100；0 才关闭，验收不改。
+  muon_config:
+    muon_lr: 4.0e-5                   # MF lr_scheduler.learning_rate；Muon 参数组峰值学习率。
+    muon_weight_decay: 0.1            # MF optimizer.weight_decay。
+    muon_momentum: 0.95               # MF optimizer.momentum。
+    muon_nesterov: true               # MF optimizer.nesterov。
+    muon_ns_steps: 5                  # MF optimizer.ns_steps；Newton–Schulz 迭代数。
+    muon_ns_epsilon: 1.0e-8           # MF Muon 的归一化 epsilon。
+    muon_ns_variant: legacy           # 当前框架 NS 系数策略，与固定 MF 基线配套；不复刻累加顺序。
+    matched_adamw_rms: 0.2            # MF optimizer.matched_adamw_rms；逻辑矩阵更新尺度。
+  adamw_config:
+    adamw_lr: 4.0e-5                  # MF 峰值 LR；与 Muon 共用同一个 LR 日程。
+    adamw_weight_decay: 0.1           # MF optimizer.weight_decay；适配器对 1D/bias 排除 decay。
+    adamw_betas: [0.9, 0.95]          # MF optimizer.adamw_betas。
+    adamw_eps: 1.0e-8                 # MF optimizer.adamw_eps。
+  # swap:                            # 无 MF 数学参数对应；当前 QK step hook 不支持 optimizer-state swap。
+  #   enabled: false                 # 仅记录关闭状态；不能在本配方直接开启。
+
+lr_scheduler:
+  _target_: hyper_parallel.components.optim.MultiLRScheduler # MF CosineWithWarmUpLR 的等价日程。
+  lr_decay_style: cosine             # MF cosine；按绝对 step 恢复，不能从续训起点重新 warmup。
+  lr_config:
+    lr: 4.0e-5                       # MF learning_rate。
+    min_lr: 2.0e-5                   # MF lr_end。
+    lr_start: 0.0                    # MF warmup_lr_init。
+    lr_warmup_steps: 1500             # MF warmup_steps；总日程取 training.lr_scheduler_iters=7500。
+
+loss_fn:
+  _target_: hyper_parallel.components.losses.ModelOutputLoss # 模型返回主 CE/加权 MTP，AUX 通过框架 AutoScaler 反传。
+
+# 模块替换只做高性能实现和并行边界适配；不修改 transformer/ 下的三个 HF 原文件。
+# 精确限定 Dense 与共享专家路径，不能让 SwiGLU 替换规则匹配 MoE 外壳。
+plan_overrides:
+  - match: ['*[!a]_layernorm', '*[.eh]norm', 'mtp.layers.*.post_norm'] # MF RMSNorm；MLA latent norm 已在模型中替换。
+    replace:
+      kind: module                   # 整个模块替换；参数由原模块继承，归一化语义不变。
+      implementation:
+        _target_: hyper_parallel.components.modules.rms_norm.RMSNorm # 框架融合 RMSNorm。
+  - match: ['model.layers.0.mlp', '*.mlp.shared_experts'] # 仅覆盖实际 Dense/共享专家，排除 MoE 外壳。
+    replace:
+      kind: module                  # 替换完整Dense/共享专家模块，保持SwiGLU语义和权重映射。
+      implementation:
+        _target_: hyper_parallel.components.modules.SwiGLUMLP # MF fusedswiglu；复用框架 fused gate/up 与 down。
+  - match: model.layers.0.mlp        # 当前唯一 Dense；与 MF 逻辑 Muon 矩阵边界保持一致。
+    params:
+      linear_fc1.weight: {tp: replicate} # 保留完整 Dense gate/up 逻辑矩阵，不在本配方另做 TP 切行。
+      linear_fc2.weight: {tp: replicate} # 保留完整 Dense down 逻辑矩阵。
+  - match: mtp.layers.*.eh_proj      # MF MTP 的 embedding/hidden 融合投影。
+    params:
+      weight: {tp: replicate}       # TP 副本共享完整投影；序列输入由 planner 边界处理。
+  - match: '*.attn_hc'              # 每层注意力前的 mHC。
+    params: &mhc_params              # 复用注意力/FFN两处mHC的相同放置约束。
+      hc_base: {tp: replicate}      # 残差流混合矩阵不按头切分。
+      hc_fn: {tp: replicate}        # 门控投影不按 TP 切分。
+      hc_scale: {tp: replicate}     # mHC 门控缩放保留副本。
+  - match: '*.ffn_hc'               # 每层 FFN 前的 mHC，使用同一参数放置约束。
+    params: *mhc_params              # FFN mHC复用上述TP副本规则，不重复定义参数布局。
+  # CP/TP 序列统计由模型构建统一绑定，不依赖下面的 EP forward 规则。
+  # EP 分发须覆盖主干和 MTP；保留无 when 规则以便 EP=1 也可配置 fix_router。
+  - match: model.layers.1.mlp.forward # 当前唯一主干 MoE，不能误匹配 Dense 的 forward。
+    replace: &moe_forward            # 主干与MTP共享同一框架专家执行入口。
+      kind: method                  # 只替换forward，保留原MoE模块和参数所有权。
+      implementation:
+        _target_: hyper_parallel.models.xing_4.adapter.distributed.expert_parallel.xing4_ep_compute_fn # 框架专家执行与EP分发。
+        fix_router: false          # 框架性能开关；只强制均衡 dispatch 目的地，保留真实权重和 AUX 统计。
+        # fix_router: true         # 仅单独吞吐/压力实验；MF force_expert_balance 并非同义参数。
+  - match: mtp.layers.*.mtp_block.mlp.forward # MTP 的实际 MoE decoder；共享上面的 fix_router 设置。
+    replace: *moe_forward            # MTP与主干MoE采用相同的专家执行和fix_router配置。
+  - match: '*.self_attn.forward'    # 主干/MTP 的 MLA 注意力并行，cp_size=1 时不启用。
+    when: cp                       # 仅 cp_size>1 时使用，不能与上面的 MoE 绑定混为一条规则。
+    region_dispatch: false         # wrapper 接收框架边界解包的本地张量。
+    replace:
+      kind: method                  # 仅替换MLA前向的CP通信边界，参数仍属于HF模型。
+      implementation:
+        _target_: hyper_parallel.models.xing_4.adapter.distributed.context_parallel.xing4_mla_cp_wrapper # 复用公共MLA CP。
+        ulysses_degree: null       # 自动采用完整 CP 域的 Ulysses；TP+CP 要求本地注意力头数可整除 CP。
+        # ulysses_degree: 1        # 仅 TP=1 时可选 KV AllGather；与 Ulysses 分开记录结果。
+        # overlap: false           # 默认为 False；通信重叠作为独立性能变量。
+        # kv_exchange: all_gather  # 默认交换策略；all_to_all_v 仅按接口适用条件另做实验。
+  - match: '*.mlp.shared_experts.linear_fc[12]' # 同时覆盖主干/MTP 共享专家的两次投影。
+    when: sequence_parallel        # 本任务 TP>1 即开 SP；单卡/纯 FSDP 不增加该边界。
+    params:
+      weight: {tp: replicate, cp: replicate, ep: replicate} # 完整共享专家逻辑矩阵，非路由专家分片。
+    in_src:
+      hidden_states: {tp: replicate, cp: 'shard(1)', ep: replicate} # MoE 外壳已收集 TP 序列，共享专家不重复收集。
+    in_dst:
+      hidden_states: {tp: replicate, cp: 'shard(1)', ep: replicate} # TP 收集当前 CP 段后计算共享专家。
+    out_src:
+      output: {tp: replicate, cp: 'shard(1)', ep: replicate} # 计算结果在 TP 组为副本。
+    out_dst:
+      output: {tp: replicate, cp: 'shard(1)', ep: replicate} # 由 MoE 外壳统一恢复 SP 布局。
+  - match: model.layers.1.mlp       # 路由统计需要当前 CP 段的完整 TP 序列。
+    when: sequence_parallel
+    region_dispatch: false
+    params: &moe_sp_params
+      gate.weight: {tp: replicate, cp: replicate, ep: replicate} # router 读取完整 hidden，权重保持副本。
+      experts.gate_up_proj: {tp: replicate, cp: replicate, ep: 'shard(0)'} # TP 不切 GMM；EP 按专家维分片。
+      experts.down_proj: {tp: replicate, cp: replicate, ep: 'shard(0)'}
+    in_src: &moe_sp_input
+      hidden_states: {tp: 'shard(1)', cp: 'shard(1)', ep: replicate}
+    in_dst: &moe_full_input
+      hidden_states: {tp: replicate, cp: 'shard(1)', ep: replicate}
+    out_src: &moe_full_output
+      output: {tp: replicate, cp: 'shard(1)', ep: replicate}
+    out_dst: &moe_sp_output
+      output: {tp: 'shard(1)', cp: 'shard(1)', ep: replicate}
+  - match: mtp.layers.*.mtp_block.mlp # MTP MoE 使用相同的序列边界与专家布局。
+    when: sequence_parallel
+    region_dispatch: false
+    params: *moe_sp_params
+    in_src: *moe_sp_input
+    in_dst: *moe_full_input
+    out_src: *moe_full_output
+    out_dst: *moe_sp_output
+
+dataset:
+  _target_: hyper_parallel.data.text.build_dataset.build_indexed_text_dataset # 复用 Indexed 构建、split 和样本数规划。
+  data_path: /path/to/data/mmap_deepseekv3_datasets_text_document # MF data_path；单一前缀，对应 .bin/.idx。
+  model_assets:
+    tokenizer:                       # 已分词语料，只提供元数据；不加载文件或重新分词。
+      _target_: hyper_parallel.data.text.build_tokenizer.AutoTokenizer.from_pretrained # 复用框架预分词元数据构建。
+      pretrained_model_name_or_path: unused # 预分词模式占位，不读取HF tokenizer文件。
+      tokenizer_type: pretokenized        # idx/bin中已经是token ID，复用框架预分词入口。
+      vocab_size: 131072              # 与 model.config.vocab_size 及 MF 词表一致。
+      eod_token_id: 2                 # MF eod_token；当前模型不支持输入窗口内部的 EOD 分段。
+      pad_token_id: 3                 # MF pad_token；正文中的同 ID 也按 padding 处理。
+  data_config:
+    seq_length: 4096                  # MF sequence_length；每条独立截断/补齐到 4097 后移位，不拼接。
+    split: "1, 0, 0"                  # 全部用于训练；框架按 train_iters × GBS 取前 N 条，不能超出记录数。
+    simple_blend: intra               # 此处为单前缀；多源 blend 不等于 MF 原 index_map，需另行核对。
+    mmap_bin_files: true              # 只读原始文件；不落盘新的 packing/shuffle 数据。
+    low_level_dataset:
+      _target_: hyper_parallel.models.xing_4.adapter.data.records.Xing4MFRecordDataset # 实测逐文档截断/补齐，不跨记录packing。
+
+dataloader:
+  _target_: hyper_parallel.data.batching.FixedBatchDataLoader # 复用框架 sampler、DP 分配和 consumed_samples 恢复。
+  collate_fn:
+    _target_: hyper_parallel.data.batching.build_indexed_collate_fn # Dataset 已处理逐条语义，框架只做默认组批。
+  get_batch:
+    _target_: hyper_parallel.data.batching.TextParallelBatch # 复用框架位置、loss mask、TP 广播和 CP 连续分片。
+    source_type: indexed             # 读 Dataset 的 input_ids/labels；默认 labels_are_shifted=True，不二次 shift。
+    attention_mode: compressed       # 这里只表示不构造/传入稠密 mask；模型仍是完整 causal MLA，不是 DSA/稀疏注意力。
+    # 默认 reset_position_ids/reset_attention_mask/eod_mask_loss=False，与既有对齐入口相同。
+    # loss_mask 由 IGNORE_INDEX 标签生成，是 padding mask，不是 SFT prompt mask。
+  sampler_type: single               # MF shuffle=False；直接复用原记录顺序，不另建 GPT 文档打乱/packing 索引。
+  drop_last: true                    # MF train_dataset.drop_remainder=True；只保留完整 batch。
+  num_workers: 0                     # 对齐时简化数据游标与下一批核验；不另写 worker/预取管理。
+  # use_background_prefetcher: false  # 默认关闭；启用后仍须核验 iterator 已消费进度。
+
+checkpoint:
+  save_ckpt: true                     # MF checkpoint.enable_save；保存完整原生训练状态。
+  checkpoint_dir: ./outputs/xing4-single/checkpoints # 单卡输出；FSDP8使用独立fsdp8-baseline目录。
+  save_steps: 1500                    # 更新完成后保存；单卡从 1500 恢复，2500 结束时仍保存最终状态。
+  save_epochs: 0                     # 不额外按 epoch 保存，避免重复 checkpoint。
+  is_async: false                    # MF checkpoint.async_save；基线同步落盘，异步性能另测。
+  save_optimizer: true                # MF no_save_optim=False；包含 Muon/AdamW 与 FP32 主权重。
+  save_train_state: true              # 保存 step、调度器、数据游标及框架支持的 RNG 状态。
+  save_extra_state_per_rank: true     # 多卡时各 rank 独立保存 extra_state，不能仅保留 rank0 RNG。
+  restore_from: null                  # fresh实测为空；单卡MF续训或FSDP8自恢复填各自完整1500目录。
+  restore_optimizer: true             # HP/MF 续训均恢复优化器槽和 FP32 主权重；fresh 时不读取。
+  restore_train_state: true           # 续接已完成步数与原 LR 日程；train_iters 仍是绝对终止步。
+  restore_dataloader_state: true      # 恢复数据进度；来源和目标的取样顺序由用户 YAML 保持一致。
+  # restore_from: /path/to/hp/global_step_1500       # 续训 HP：直接加载原生保存目录。
+  # restore_from: /path/to/mf-converted/checkpoint   # 续训 MF：先按 README 离线转换，再用同一加载入口。
+  # restore_from: LATEST              # 仅指本输出目录；正式跨配置自洽使用显式的同一个源 checkpoint。
+  # save_total_limit: 2               # 可选保留数量；先归档关键 1500/2500，再允许清理旧副本。
+
+# 以下是按需启用的诊断配置，默认全部不启用；profiling 运行不要混入稳态性能测量。
+# MF profiler.enable_profiling/start_step/end_step 对应 enable/start_step/stop_step；本实现按会话相对步数。
+# profiler:
+#   enable: true                      # 开始采集；本次训练会话从 1 计数，不读取恢复的 global_step。
+#   start_step: 11                    # 从 1500 恢复时，对应 global 1511；fresh 则是 global 11。
+#   stop_step: 13                     # 含末步；恢复 1500 时采至 global 1513，短窗口控制 trace 体积。
+#   warmup_steps: 1                   # 本会话第 10 步仅预热 profiler，必须小于 start_step。
+#   rank_ids: [0]                     # MF profiler_rank；null/[] 会采集所有 rank，四卡定位通信再按需全采。
+#   output_path: ./outputs/xing4-single # 输出至 profile/rank_N；每个实验使用独立根目录。
+#   level: 1                         # MF profiler_level；0/1/2 逐步增加采样细节与开销。
+#   memory: true                     # MF profile_memory；记录 tensor 内存事件，不等于 allocator 快照。
+#   with_stack: false                # MF with_stack；开 Python 栈会增加开销。
+#   data_simplification: false       # 是否让 torch-npu 裁减辅助 CANN 数据，保留原始分析材料时为 False。
+#   analysis:
+#     enable: true                   # NPU 采集后自动解析；大型 trace 可关闭后离线处理。
+#     async_mode: false              # 是否异步解析，不是训练或 checkpoint 的异步开关。
+# MF profile_cpu 不是本 HP ProfilerConfig 的公开字段，不能原名照抄到这里。
+#
+# memory:
+#   enable: false                     # allocator 历史/快照；需要 PTA 的 _record_memory_history/_dump_snapshot。
+#   mem_info: true                    # 可独立开启；每步开始记录并重置上一段 max allocated/reserved，单位 byte。
+#   start_step: 11                    # 本会话相对步数，不是 global_step；从 1500 恢复时为第 1511 步。
+#   end_step: 13                     # 含末步，下一控制点导出；进程正常结束也会完成收尾。
+#   save_path: ./outputs/xing4-single/memory # 独立输出；不能把快照采样开销计入无采样性能。
+#   dump_ranks: [0]                  # 仅控制快照输出，mem_info 仍逐卡记录；四卡全采可设 [0,1,2,3]。
+#   stacks: all                      # all/python；快照调用栈详细程度。
+# allocated 是活跃张量占用，reserved 包含 allocator 缓存；两者均不同于 npu-smi 的整进程占用。
