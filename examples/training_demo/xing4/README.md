@@ -4,9 +4,9 @@
 
 本目录只有 [train_single.yaml](train_single.yaml) 和本文档，MF→HP 转换只有 [tools/convert_mf_checkpoint.py](../../../tools/convert_mf_checkpoint.py) 一个入口。训练直接使用框架 `examples.training_demo.train_text`。两个 PR 尚未合入时，按下文在最新官方 master 上依次应用 PR #3、PR #2；依赖与已验证版本见[总 issue #1](https://github.com/xingleixu123/hyper-parallel-personal/issues/1)顶部表格。
 
-## 源码准备：最新主仓 + 两个单提交
+## 源码准备：最新主仓 + 两份 PR
 
-PR #3、PR #2 各保留一个提交，顺序为 **PR #3（公共 Trainer）→ PR #2（Xing4 模型与转换）**，总共两次 cherry-pick。抓取 PR 当前 head，不使用 squash 前的历史提交列表。需要私仓读取权限；以下命令在 Bash 中执行。
+应用顺序为 **PR #3（公共 Trainer）→ PR #2（Xing4 模型与转换）**。抓取 PR 当前 head，并应用各自尚未包含在官方 master 中的完整提交范围；PR 追加修复后，只 cherry-pick 最新一个提交会漏掉此前的模型实现。不使用 squash 前的历史提交列表。需要私仓读取权限；以下命令在 Bash 中执行。
 
 ```bash
 export HP_ROOT=/absolute/path/to/new-hyper-parallel
@@ -33,9 +33,15 @@ UPSTREAM_SHA=$(git rev-parse refs/remotes/xing-upstream/master)
 PR3_SHA=$(git rev-parse refs/remotes/xing-pr/pr3)
 PR2_SHA=$(git rev-parse refs/remotes/xing-pr/pr2)
 
-# 确认当前增量所基于的依赖已经在官方 master 内。
+# PR #3 有一个提交，PR #2 有两个。提交数量变化时先核对 Commits 页。
 git merge-base --is-ancestor "$PR3_SHA^" "$UPSTREAM_SHA"
-git merge-base --is-ancestor "$PR2_SHA^" "$UPSTREAM_SHA"
+git merge-base --is-ancestor "$PR2_SHA~2" "$UPSTREAM_SHA"
+mapfile -t PR3_COMMITS < <(git rev-list --reverse --topo-order "$UPSTREAM_SHA..$PR3_SHA")
+mapfile -t PR2_COMMITS < <(git rev-list --reverse --topo-order "$UPSTREAM_SHA..$PR2_SHA")
+test "${#PR3_COMMITS[@]}" -eq 1
+test "${#PR2_COMMITS[@]}" -eq 2
+printf 'pr3_commit=%s\n' "${PR3_COMMITS[@]}" | tee -a "$(git rev-parse --git-path xing4-assembly.log)"
+printf 'pr2_commit=%s\n' "${PR2_COMMITS[@]}" | tee -a "$(git rev-parse --git-path xing4-assembly.log)"
 ASSEMBLY_BRANCH=codex/xing4-local
 if git show-ref --verify --quiet "refs/heads/$ASSEMBLY_BRANCH"; then
     OLD_HEAD=$(git rev-parse "refs/heads/$ASSEMBLY_BRANCH")
@@ -44,11 +50,11 @@ if git show-ref --verify --quiet "refs/heads/$ASSEMBLY_BRANCH"; then
     printf 'backup=%s\n' "$BACKUP_REF"
 fi
 git switch -C "$ASSEMBLY_BRANCH" "$UPSTREAM_SHA"
-git cherry-pick -x "$PR3_SHA"
-git cherry-pick -x "$PR2_SHA"
+git cherry-pick -x "${PR3_COMMITS[@]}"
+git cherry-pick -x "${PR2_COMMITS[@]}"
 
 git merge-base --is-ancestor "$UPSTREAM_SHA" HEAD
-test "$(git rev-list --count "$UPSTREAM_SHA"..HEAD)" -eq 2
+test "$(git rev-list --count "$UPSTREAM_SHA"..HEAD)" -eq "$((${#PR3_COMMITS[@]} + ${#PR2_COMMITS[@]}))"
 git diff --stat "$UPSTREAM_SHA" HEAD
 git diff --name-status "$UPSTREAM_SHA" HEAD
 git status --short
@@ -60,9 +66,9 @@ printf 'upstream=%s pr3=%s pr2=%s assembled=%s tree=%s\n' \
 
 每次 fetch 后分别固定官方 master 和两份 PR 的 SHA；“最新”指本次抓取的版本，不代表运行过程中持续更新。备份位于本地 `refs/xing4-backup/`，不会每次新增工作分支。fetch 的 `+` 只更新本地引用，以接收 PR squash 后的新 head；`git switch -C` 只重建上述专用本地分支，旧提交由备份保留。
 
-cherry-pick 应用提交相对父提交的增量，不会把私仓旧 master 整棵树覆盖到官方主仓。PR #3 的网页 base 是历史依赖分支，所需 #1453 已在当前主仓内，只需应用 PR #3 的当前提交。仍须核对实际 diff，确认范围外文件没有回退或删除；祖先检查不能替代内容审查，也不能证明未来所有主仓版本都兼容。
+cherry-pick 应用提交相对父提交的增量，不会把私仓旧 master 整棵树覆盖到官方主仓。PR #3 的网页 base 是历史依赖分支，所需 #1453 已在当前主仓内。仍须核对实际提交列表和 diff，确认只有两份 PR 的增量，范围外文件没有回退或删除；提交计数不能替代内容审查，也不能证明未来所有主仓版本都兼容。
 
-执行前确认两份 PR 的 Commits 页仍各为一个提交。遇到空提交或冲突，脚本会停止；先核对是否已被主仓完整或部分吸收，以及接口是否变化，不机械使用 `--ours`、`--theirs` 或 `--skip`。撤销当前 cherry-pick 可用 `git cherry-pick --abort`。若某 PR 已完整合入，只应用剩余增量，并相应调整两提交计数检查；两者均已合入时直接使用官方 master。
+执行前核对两份 PR 的 Commits 页。遇到空提交或冲突，脚本会停止；先核对是否已被主仓完整或部分吸收，以及接口是否变化，不机械使用 `--ours`、`--theirs` 或 `--skip`。撤销当前 cherry-pick 可用 `git cherry-pick --abort`。若某 PR 已完整合入，只应用剩余增量；两者均已合入时直接使用官方 master。
 
 组装成功后继续下文安装和训练，将 `.git/xing4-assembly.log` 中的实际 SHA、配置和环境版本一起归档。历史精度结果对应总 issue 中固定的实际运行版本；主仓或任一 PR 更新后，应针对变化复核，不能自动沿用旧结果宣称新版本已验收。
 
@@ -145,6 +151,18 @@ YAML 各项均有中文注释。共同模型为 1 Dense +1 MoE 主干、1 MTP、
 | 重计算选择 | 主干 `[0,1]`，不含MTP | 默认选择器，off时不使用 |
 
 两种配置除表内策略和数据/输出/恢复路径外，已与归档的实际运行配置逐项核对。单卡GBS2与FSDP8的GBS8分别建立基线；8个LBS1的DP rank不能使用GBS2。
+
+`model.config.enable_hyper_connections` 控制主干 mHC，`mtp_enable_hyper_connections` 控制 MTP。MTP 开关省略或设为 `null` 时跟随主干。与 MF 一样，开启 MTP mHC 需要先开启主干 mHC。
+
+| 训练结构 | `enable_hyper_connections` | `mtp_enable_hyper_connections` |
+| --- | --- | --- |
+| 主干与 MTP 均使用 mHC（示例默认） | `true` | `null` 或 `true` |
+| 主干使用 mHC，MTP 使用普通残差 | `true` | `false` |
+| 主干与 MTP 均使用普通残差 | `false` | `null` 或 `false` |
+
+所有组合均保留 `use_fused_mhc: true`。关闭 mHC 的层采用普通残差，最终模型不包含这些层的 mHC 参数。两处均关闭时，构建入口停用示例中的两条 mHC 专用 FP32 参数规则。融合、CMHC 和 clamp 等选项保留原值，只有存在 mHC 的层执行融合算子。
+
+MF 对照时，两边分别设置相同的主干和 MTP 开关。凡有普通残差的层，MF 配方使用 `hidden_dropout: 0.0` 和 `apply_residual_connection_post_layernorm: false`。续训和离线转换都需要源、目标采用匹配的主干和 MTP 结构；MF 的主干开、MTP 关 checkpoint 对应表中第二行。
 
 数据输入是已有的同前缀 `.bin`、`.idx`，不是转换脚本生成的新数据。设置 `DATA_PREFIX` 或 YAML `dataset.data_path` 更换数据；同时核对词表131072、EOD2、pad3、序列长度4096及实际样本。默认 `Xing4MFRecordDataset` 逐文档截断/补齐到4097后移位，不跨文档packing；普通预训练可按数据需要改用框架原生GPT Dataset，MF续训对照需保持实际样本语义一致。
 

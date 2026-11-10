@@ -35,6 +35,7 @@ training-checkpoint entry point.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
+from dataclasses import replace
 from functools import partial
 from typing import Any
 
@@ -44,6 +45,7 @@ import torch.nn.functional as F
 import torch_npu
 from torch import nn
 from transformers import PreTrainedModel
+from transformers.modeling_outputs import BaseModelOutputWithPast
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 from transformers.utils import ModelOutput
 
@@ -88,7 +90,6 @@ _REQUIRED_OPTIONS = {
     "use_fused_mhc": True,
     "enable_cmhc": False,
     "enable_hc_head": False,
-    "mtp_enable_hyper_connections": True,
     "hc_sinkhorn_clamp": None,
     "mhc_h_res_clamp_min": None,
     "mhc_h_res_clamp_max": None,
@@ -388,11 +389,13 @@ class Xing4FusedHyperConnection(Xing4_0HyperConnection):
 class Xing4DecoderLayer(Xing4_0DecoderLayer):
     """Install the high-performance blocks around the official decoder weights."""
 
-    def __init__(self, config: Any, layer_idx: int, source: nn.Module | None = None) -> None:
+    def __init__(self, config: Any, layer_idx: int, *, enable_hyper_connections: bool,
+                 source: nn.Module | None = None) -> None:
         """Apply the recipe's norm and scaling values, then adopt the shared modules."""
         nn.Module.__init__(self)
         source = Xing4_0DecoderLayer(config, layer_idx) if source is None else source
         self.hidden_size = source.hidden_size
+        self.enable_hyper_connections = enable_hyper_connections
         # The official attention builds its latent norms with the module default epsilon and
         # the wrapper snapshots them, so the recipe values must be applied before wrapping.
         source.self_attn.q_a_layernorm.variance_epsilon = config.rms_norm_eps
@@ -404,13 +407,19 @@ class Xing4DecoderLayer(Xing4_0DecoderLayer):
         self.mlp = Xing4MoE(config, source.mlp, layer_idx) if isinstance(source.mlp, Xing4_0MoE) else source.mlp
         self.input_layernorm = source.input_layernorm
         self.post_attention_layernorm = source.post_attention_layernorm
-        source.attn_hc.input_norm.eps = source.ffn_hc.input_norm.eps = config.mhc_layernorm_epsilon
-        self.attn_hc = Xing4FusedHyperConnection(source.attn_hc)
-        self.ffn_hc = Xing4FusedHyperConnection(source.ffn_hc)
+        if self.enable_hyper_connections:
+            source.attn_hc.input_norm.eps = source.ffn_hc.input_norm.eps = config.mhc_layernorm_epsilon
+            self.attn_hc = Xing4FusedHyperConnection(source.attn_hc)
+            self.ffn_hc = Xing4FusedHyperConnection(source.ffn_hc)
 
     def forward(self, hidden_states: torch.Tensor, attention_mask: torch.Tensor | None = None,
                 position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None, **kwargs: Any) -> torch.Tensor:
-        """Call the official blocks through the fused mHC pre/post operations."""
+        """Run the shared blocks with ordinary residuals or fused mHC."""
+        if not self.enable_hyper_connections:
+            output = self.self_attn(hidden_states=self.input_layernorm(hidden_states),
+                                    position_embeddings=position_embeddings, attention_mask=attention_mask, **kwargs)[0]
+            hidden_states = hidden_states + output
+            return hidden_states + self.mlp(self.post_attention_layernorm(hidden_states))
         post, mix, collapsed, residual = self.attn_hc(hidden_states)
         output = self.self_attn(hidden_states=self.input_layernorm(collapsed),
                                 position_embeddings=position_embeddings, attention_mask=attention_mask, **kwargs)[0]
@@ -458,7 +467,7 @@ def _init_training_weights(owner: Xing4_0PreTrainedModel, module: nn.Module) -> 
 
 
 class Xing4Model(Xing4_0Model):
-    """Use the unchanged HF backbone forward with training-aware decoder blocks."""
+    """Use the HF backbone with optional hyper-connections for training."""
 
     config_class = Xing4_0Config
     _init_weights = _init_training_weights
@@ -469,7 +478,9 @@ class Xing4Model(Xing4_0Model):
         super().__init__(config)
         self.sequence_group = None
         self.layers = nn.ModuleList(
-            Xing4DecoderLayer(config, index, source=layer) for index, layer in enumerate(self.layers))
+            Xing4DecoderLayer(config, index, enable_hyper_connections=config.enable_hyper_connections, source=layer)
+            for index, layer in enumerate(self.layers)
+        )
         rotary = self.rotary_emb
         rope_init_fn = (rotary.compute_default_rope_parameters if rotary.rope_type == "default"
                         else ROPE_INIT_FUNCTIONS[rotary.rope_type])
@@ -478,6 +489,32 @@ class Xing4Model(Xing4_0Model):
         for name in ("inv_freq", "original_inv_freq"):
             register_rebuildable_buffer(rotary, name, value=frequencies)
         self.post_init()
+
+    def forward(self, input_ids: torch.Tensor | None = None, attention_mask: torch.Tensor | None = None,
+                position_ids: torch.Tensor | None = None, past_key_values: Any = None,
+                inputs_embeds: torch.Tensor | None = None, use_cache: bool | None = None,
+                **kwargs: Any) -> BaseModelOutputWithPast:
+        """Run the backbone for training.
+
+        The plain residual path keeps three-dimensional hidden states and
+        requires causal attention without an explicit mask or KV cache.
+        """
+        if self.config.enable_hyper_connections:
+            return super().forward(input_ids=input_ids, attention_mask=attention_mask, position_ids=position_ids,
+                                   past_key_values=past_key_values, inputs_embeds=inputs_embeds,
+                                   use_cache=use_cache, **kwargs)
+        if attention_mask is not None or use_cache or past_key_values is not None:
+            raise ValueError("Xing4 plain-residual training does not support attention masks or KV cache")
+        if (input_ids is None) == (inputs_embeds is None):
+            raise ValueError("Specify exactly one of input_ids or inputs_embeds")
+        hidden_states = self.embed_tokens(input_ids) if inputs_embeds is None else inputs_embeds
+        if position_ids is None:
+            position_ids = torch.arange(hidden_states.shape[1], device=hidden_states.device).unsqueeze(0)
+        position_embeddings = self.rotary_emb(hidden_states, position_ids=position_ids)
+        for layer in self.layers:
+            hidden_states = layer(hidden_states, position_embeddings=position_embeddings,
+                                  position_ids=position_ids, **kwargs)
+        return BaseModelOutputWithPast(last_hidden_state=self.norm(hidden_states))
 
     def shift_tokens(self, tokens: torch.Tensor, pad_value: int) -> torch.Tensor:
         """Shift contiguous CP rows left, padding only the global sequence tail.
@@ -509,15 +546,17 @@ class Xing4Model(Xing4_0Model):
 
 
 class Xing4MTPBlock(Xing4DecoderLayer):
-    """Adapt the shared MTP block's 3-D input to official Xing4 residual streams."""
+    """Apply the configured MTP residual policy to the block's 3-D input."""
 
     def __init__(self, config: Any, layer_idx: int) -> None:
         """Use the HF decoder selected for this MTP depth."""
-        super().__init__(config, layer_idx)
+        super().__init__(config, layer_idx, enable_hyper_connections=config.mtp_enable_hyper_connections)
         self.hc_mult = config.hc_mult
 
     def forward(self, hidden_states: torch.Tensor, **kwargs: Any) -> torch.Tensor:
-        """Expand and collapse streams, leaving fusion and norms to MTPLayer."""
+        """Expand and collapse streams only when mHC is enabled."""
+        if not self.enable_hyper_connections:
+            return super().forward(hidden_states, **kwargs)
         streams = hidden_states.unsqueeze(2).expand(-1, -1, self.hc_mult, -1).contiguous()
         return super().forward(streams, **kwargs).mean(dim=2)
 
@@ -638,6 +677,11 @@ def create_config(config: dict[str, Any]) -> Xing4_0Config:
     values.setdefault("moe_n_hash_layers", 0)
     values.setdefault("moe_router_group_score_topk", 2)
     values.setdefault("moe_router_force_expert_balance", False)
+    values.setdefault("enable_hyper_connections", True)
+    if values.get("mtp_enable_hyper_connections") is None:
+        values["mtp_enable_hyper_connections"] = values["enable_hyper_connections"]
+    if values["mtp_enable_hyper_connections"] and not values["enable_hyper_connections"]:
+        raise ValueError("mtp_enable_hyper_connections requires enable_hyper_connections to be enabled")
     unsupported = sorted(name for name, required in _REQUIRED_OPTIONS.items()
                          if values.setdefault(name, required) != required)
     if unsupported:
@@ -669,7 +713,18 @@ def build_model(*, config: dict[str, Any], **options: Any) -> PreTrainedModel:
         raise ValueError(
             "Xing4 requires model_init_dtype='float32', or unset with torch.get_default_dtype() == torch.float32"
         )
-    model = HyperAutoModelForCausalLM.from_config(create_config(config), **options)
+    model_config = create_config(config)
+    setup = options.get("distributed_setup")
+    if not model_config.enable_hyper_connections and setup is not None and setup.strategy_config is not None:
+        # Disabled mHC blocks have no parameters for the recipe's precision rules.
+        strategy = setup.strategy_config
+        precision = strategy.mix_precision
+        custom_params = {name: dtype for name, dtype in precision.custom_params.items()
+                         if name not in ("*.attn_hc.*", "*.ffn_hc.*")}
+        options["distributed_setup"] = replace(
+            setup, strategy_config=replace(strategy, mix_precision=replace(precision, custom_params=custom_params))
+        )
+    model = HyperAutoModelForCausalLM.from_config(model_config, **options)
     mesh = getattr(options.get("distributed_setup"), "mesh_context", None)
     if mesh is not None:
         cp_group = mesh.cp_mesh.get_group() if mesh.cp_size > 1 else None

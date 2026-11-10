@@ -269,6 +269,8 @@ def _build_target(config: Any) -> tuple[Any, list, dict[str, float]]:
             rename(f"{source}.{part}.linear_fc2.weight",
                    f"{target}.{part}.{'linear_fc2' if fused in targets else 'down_proj'}.weight")
         for part in ("attn_hc", "ffn_hc"):
+            if f"{target}.{part}.hc_base" not in targets:
+                continue
             rename(f"{source}.{part}.bias", f"{target}.{part}.hc_base")
             rename(f"{source}.{part}.mapping_proj.weight", f"{target}.{part}.hc_fn")
             rules.append(WeightConverter(

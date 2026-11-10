@@ -67,14 +67,14 @@ model:
       mscale: 1                         # MF mscale。
       mscale_all_dim: 1                 # MF mscale_all_dim。
 
-    # mHC：主干和 MTP 均保留四条残差流，使用融合算子；CMHC、HC head、clamp 不启用。
-    enable_hyper_connections: true      # MF 同名字段；本模型固定保留 mHC 结构。
+    # mHC：启用的层使用融合算子；CMHC、HC head、clamp 保持关闭。
+    enable_hyper_connections: true      # MF 同名字段；主干的 mHC 结构开关。
+    mtp_enable_hyper_connections: null  # MF 同名字段；null 跟随主干，false 仅关闭 MTP。主干关闭时 MTP 也须关闭。
     hc_mult: 4                         # MF num_residual_streams；残差流数。
     hc_sinkhorn_iters: 20              # MF mhc_sinkhorn_iterations；Sinkhorn 迭代数。
     mhc_init_gating_factor: 0.01        # MF 同名字段；mHC 门控缩放的初始化值。
     mhc_layernorm_epsilon: 1.0e-6       # MF mHC 归一化 epsilon；融合 pre 使用该值。
-    use_fused_mhc: true                 # MF 同名字段；本接入支持的融合 mHC 路径。
-    mtp_enable_hyper_connections: true  # MF 同名语义；MTP decoder 也使用 mHC。
+    use_fused_mhc: true                 # mHC 开启时使用融合算子；关闭结构也保留 true，不切换为非融合实现。
     enable_cmhc: false                 # MF 同名字段；当前不支持 CMHC，保持关闭。
     enable_hc_head: false              # MF 同名字段；末端按流均值合并，不增加 HC head。
     mhc_h_res_clamp_min: null          # MF hc_sinkhorn_clamp 的下界；已授权两侧均不 clamp。
@@ -158,7 +158,7 @@ fsdp_config:
     reduce_dtype: float32             # MF 梯度 FP32 规约；fp32_main_params 的必要配套。
     cast_forward_inputs: false        # 不全局强转入口，保留模型显式的 FP32 残差/RoPE 路径。
     custom_params:
-      '*.attn_hc.*': {param_dtype: float32} # MF mHC 参数保留 FP32，不能随普通权重转成 BF16。
+      '*.attn_hc.*': {param_dtype: float32} # MF mHC 参数保留 FP32；关闭 mHC 时构建入口自动停用这两条规则。
       '*.ffn_hc.*': {param_dtype: float32}  # 同上，FFN mHC。
       '*.mlp.gate.weight': {param_dtype: float32} # MF moe_router_params_dtype。
       mtp.layers.*.enorm.weight: {param_dtype: float32} # MF MTP embedding norm 参数。
