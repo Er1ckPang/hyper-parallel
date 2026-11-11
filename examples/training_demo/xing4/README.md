@@ -70,19 +70,63 @@ cherry-pick 应用提交相对父提交的增量，不会把私仓旧 master 整
 
 执行前核对两份 PR 的 Commits 页。遇到空提交或冲突，脚本会停止；先核对是否已被主仓完整或部分吸收，以及接口是否变化，不机械使用 `--ours`、`--theirs` 或 `--skip`。撤销当前 cherry-pick 可用 `git cherry-pick --abort`。若某 PR 已完整合入，只应用剩余增量；两者均已合入时直接使用官方 master。
 
-组装成功后继续下文安装和训练，将 `.git/xing4-assembly.log` 中的实际 SHA、配置和环境版本一起归档。历史精度结果对应总 issue 中固定的实际运行版本；主仓或任一 PR 更新后，应针对变化复核，不能自动沿用旧结果宣称新版本已验收。
+联合选择重计算按[总 issue](https://github.com/xingleixu123/hyper-parallel-personal/issues/1)应用主仓 #1538 的增量。组装成功后继续下文安装和训练，将 `.git/xing4-assembly.log` 中的实际 SHA、配置和环境版本一起归档。历史精度结果对应总 issue 中固定的实际运行版本；主仓或任一 PR 更新后，应针对变化复核，不能自动沿用旧结果宣称新版本已验收。
 
 ## HP 环境与安装
 
-实测 HP 环境为 Python3.12.14、torch2.12.0+cpu、torch_npu2.12.0.post3、Transformers5.21.0、CANN9.2.0 B237、Ascend910B3。MF 源运行环境为 MF `62ab670a6a86c3f42ef2e52284b289eba69238d4`、HP-MS `c95c7514053abdd9460b6b55cf4b4021ffbc246d`、MS2.10.0 build `6b7c4b02`、CANN9.1.0 B243；转换进程不需要安装或导入 MindSpore。
+| 用途 | 源码 | 运行环境 |
+| --- | --- | --- |
+| MF 连续单卡基线 | [Somnus master](https://gitcode.com/Somnus2020/mindformers_formal_v1.0) `62ab670a`，MF 侧 HyperParallel [r1.0.0](https://github.com/mindspore-ai/hyper-parallel/tree/r1.0.0) `c95c7514` | Python 3.12.14，[MindSpore 2.10.0 build `6b7c4b02`](https://repo.mindspore.cn/mindspore/mindspore/version/202611/20261104/r2.10_20261104091850_6b7c4b0274392eb09ee3a5652ba14e3ed7a270b4_newest/unified/aarch64/mindspore-2.10.0-cp312-cp312-linux_aarch64.whl)，CANN 9.1.0 B243，Ascend 910B3 |
+| HP Python 3.11 复验 | 官方 master `79f1597d` 加私仓 #3、#2 的两条实现提交与 [主仓 #1538](https://github.com/mindspore-ai/hyper-parallel/pull/1538)，运行 tree `0e4b1d99` | Python 3.11.18，PyTorch 2.13.0+cpu，Transformers 5.21.0，MindSpore 3.0.0b0 内置 TorchNPU 2.13.0，CANN 9.2.0 B237 / 9.2.1 |
+| HP 独立 PTA 2.13 长窗 | 同一运行 tree `0e4b1d99` | Python 3.12.14 / 3.12.16，PyTorch 2.13.0+cpu，独立 TorchNPU 2.13.0，Transformers 5.21.0，CANN 9.2.0 B237 / 9.2.1 |
+| HP 独立 PTA 2.12 历史环境 | 对应[总 issue 的历史记录](https://github.com/xingleixu123/hyper-parallel-personal/issues/1) | Python 3.12.14，PyTorch 2.12.0+cpu，TorchNPU 2.12.0.post3，Transformers 5.21.0，CANN 9.2.0 B237，Ascend 910B3 |
+
+MF 连续训练第 1–2500 步，在第 1500 步更新完成后保存模型、优化器、调度器和数据游标。HP 单卡从该 checkpoint 恢复，逐步对照 MF 的第 1501–2500 步。实际验收状态、固定提交和曲线见[总 issue](https://github.com/xingleixu123/hyper-parallel-personal/issues/1)。
+
+### Python 3.11 与 MindSpore 内置 TorchNPU
+
+在独立的 HP 虚拟环境中安装下面两份 Linux aarch64 wheel。MF 使用表中独立环境。
+
+- [PyTorch 2.13.0+cpu，cp311](https://download-r2.pytorch.org/whl/cpu/torch-2.13.0%2Bcpu-cp311-cp311-manylinux_2_28_aarch64.whl)
+- [MindSpore 3.0.0b0，cp311，build `6c261c45`](https://repo.mindspore.cn/mindspore/mindspore/version/202611/20261110/next_gen_20261110141311_6c261c451fc672bc260fa41dc82845a697e5bfb8/ascend/aarch64/mindspore-3.0.0b0-cp311-cp311-linux_aarch64.whl)
+
+```bash
+export HP_VENV=/absolute/path/to/hp-py311-venv
+export PT_WHEEL=/absolute/path/to/torch-2.13.0+cpu-cp311-cp311-manylinux_2_28_aarch64.whl
+export MS_WHEEL=/absolute/path/to/mindspore-3.0.0b0-cp311-cp311-linux_aarch64.whl
+python3.11 -m venv "$HP_VENV"
+source "$HP_VENV/bin/activate"
+printf '%s  %s\n' \
+  84453b69508ec79902f899c5ed9495acb9e2bbe9fda5f1d5d6f19e3c3842e1a7 "$PT_WHEEL" \
+  526c6149b1b8da432f7e947fa6540f8019231565cefd95ba276b20dd905630fc "$MS_WHEEL" | sha256sum -c -
+python -m pip uninstall -y torch-npu
+python -m pip install "$PT_WHEEL" "$MS_WHEEL" 'numpy==1.26.4' 'pandas==2.3.3'
+export TORCH_DEVICE_BACKEND_AUTOLOAD=1
+```
+
+继续安装下文的 HP 和训练依赖。安装后先在虚拟环境内运行 `python -m pip check`，再激活 CANN 9.2 环境并检查实际后端来源。
+
+```bash
+python - <<'PY'
+from importlib.metadata import version
+
+import torch
+import torch_npu
+
+assert torch.__version__ == "2.13.0+cpu"
+assert version("mindspore") == "3.0.0b0"
+assert "/mindspore/_bundled/torch_npu/" in torch_npu.__file__
+print(torch.__version__, version("mindspore"), torch_npu.__version__, torch_npu.__file__)
+PY
+```
 
 版本来源可查 [CANN 下载](https://www.hiascend.com/cann/download)、[TorchNPU Release](https://gitcode.com/Ascend/pytorch/releases)、[MindSpore 构建目录](https://repo.mindspore.cn/mindspore/mindspore/version/)和[版本配套查询](https://www.hiascend.com/developer/download/compatibility)，按架构、Python ABI 和固定 build 选择。
 
-先按[仓库安装指南](../../../docs/installation.md)准备相互匹配的 HP wheel、工具链和依赖。实测核心依赖还包括 NumPy 2.5.3、PyYAML 6.0.3、safetensors 0.8.0、pydantic 2.13.5、pybind11 3.1.0 和 setuptools 80.9.0；按固定版本准备，不做无约束升级。融合 mHC 还需要与 PTA/CANN/芯片匹配的 Omni Python 扩展及 custom OPP，以下先安装 HP，再构建 Omni。
+先按[仓库安装指南](../../../docs/installation.md)准备相互匹配的 HP wheel、工具链和依赖。Python 3.11 复验锁定 NumPy 1.26.4。训练依赖包括 PyYAML 6.0.3、safetensors 0.8.0、pydantic 2.13.5、pybind11 3.1.0 和 setuptools 80.9.0；按固定版本准备，不做无约束升级。融合 mHC 还需要与 PTA/CANN/芯片匹配的 Omni Python 扩展及 custom OPP，以下先安装 HP，再构建 Omni。
 
 ```bash
 export HP_ROOT=/absolute/path/to/hyper-parallel
-export HP_VENV=/absolute/path/to/hp-venv
+export HP_VENV="${HP_VENV:-/absolute/path/to/hp-venv}"
 export CANN_ENV=/absolute/path/to/cann/set_env.sh
 export RUN_ROOT=/absolute/path/to/new-runs
 export HP_CONFIG="$HP_ROOT/examples/training_demo/xing4/train_single.yaml"
@@ -105,7 +149,7 @@ mkdir -p "$RUN_ROOT"
 在隔离源码副本固定 `45919b54b619ac5532ed2dc83fbca82ddd243540`；确认干净且工具链、磁盘和设备匹配。官方源码地址为 https://gitee.com/omniai/omni-ops ，固定提交已被 fetch，源码与先前构建快照的 2887 个源文件逐字节一致，6 项 OPP 已完成 CPU 重建。`OMNI_ROOT`、`CANN_HOME`、`RUN_ROOT` 指向实际路径；该构建示例是历史 B237 适配经验，必须验证实际环境。
 
 ```bash
-export CANN_HOME=/absolute/path/to/cann-9.2.0
+export CANN_HOME=/absolute/path/to/active-cann-9.2
 export OMNI_ROOT="$RUN_ROOT/omni-ops"
 git clone https://gitee.com/omniai/omni-ops "$OMNI_ROOT"
 git -C "$OMNI_ROOT" checkout --detach 45919b54b619ac5532ed2dc83fbca82ddd243540
@@ -123,11 +167,17 @@ export ASCEND_CUSTOM_OPP_PATH="${ASCEND_CUSTOM_OPP_PATH:-}"
 source "$RUN_ROOT/vendor-opp/vendors/omni_training_custom_transformer/bin/set_env.bash"
 export CPLUS_INCLUDE_PATH="$RUN_ROOT/vendor-opp/vendors/omni_training_custom_transformer/op_api/include"
 export LIBRARY_PATH="$RUN_ROOT/vendor-opp/vendors/omni_training_custom_transformer/op_api/lib"
-export TORCH_DEVICE_BACKEND_AUTOLOAD=0
+export TORCH_DEVICE_BACKEND_AUTOLOAD="${TORCH_DEVICE_BACKEND_AUTOLOAD:-0}"
+export CC="${CC:-gcc}" CXX="${CXX:-g++}"
 cd "$OMNI_ROOT/training/ascendc/torch_ops_extension"
+# 固定 Omni 版本在 PyTorch 2.13 中使用已移除的头文件。该 include 没有参与算子实现。
+if python -c 'import torch; raise SystemExit(not torch.__version__.startswith("2.13."))'; then
+  sed -i '/^#include <ATen\/NamedTensorUtils.h>$/d' omni_training_custom_ops/csrc_base/ops_common.h
+fi
 python -B setup.py build --parallel 1
 export OMNI_ENV="$RUN_ROOT/vendor-opp/vendors/omni_training_custom_transformer/bin/set_env.bash"
-export OMNI_PYEXT="$OMNI_ROOT/training/ascendc/torch_ops_extension/build/lib.linux-aarch64-cpython-312"
+PY_ABI=$(python -c 'import sys; print(f"{sys.version_info.major}{sys.version_info.minor}")')
+export OMNI_PYEXT="$OMNI_ROOT/training/ascendc/torch_ops_extension/build/lib.linux-aarch64-cpython-$PY_ABI"
 test -d "$OMNI_PYEXT"
 source "$OMNI_ENV"
 export PYTHONPATH="$OMNI_PYEXT${PYTHONPATH:+:$PYTHONPATH}"
@@ -188,7 +238,7 @@ python -m pip check
 
 按冻结源码安装剩余依赖时避免自动升级或替换 MindSpore；CANN 设备 kernel 和源码权限需事先准备。下面先验证实际版本，不能仅凭 wheel 文件名判定。
 
-目标Linux aarch64/910B、Python3.12.14、MF62ab、HP-MS c95、MindSpore **2.10.0 build 6b7c4b02**、CANN **9.1.0 B243**。这是指定实验栈，配套状态另依官方查询；CANN9.2是另一套HP运行环境，不能混入MF。优先复用完全匹配的环境；如需新环境，必须从官方构建目录取得精确 `6b7c4b02` 的 aarch64/cp312 wheel 并独立核验，目前未核出该 build 可公开获得的精确 wheel 直链。不得无约束升级 MindSpore。MF/HP-MS其余依赖按冻结源和环境单独安装并锁版本，不用可能替换MS的无约束依赖安装；`pip check`与实际import验证。目标环境需C++/Python开发头、`ninja`、`make`、`pybind11`，检查 `command -v ninja` 后再编译；不要假设python虚拟环境中自带ninja。
+目标Linux aarch64/910B、Python3.12.14、MF62ab、HP-MS c95、MindSpore **2.10.0 build 6b7c4b02**、CANN **9.1.0 B243**。这是指定实验栈，配套状态另依官方查询；CANN9.2是另一套HP运行环境，不能混入MF。优先复用完全匹配的环境；如需新环境，必须从官方构建目录取得精确 `6b7c4b02` 的 aarch64/cp312 wheel 并独立核验，上表给出已核验的官方 wheel 直链。不得无约束升级 MindSpore。MF/HP-MS其余依赖按冻结源和环境单独安装并锁版本，不用可能替换MS的无约束依赖安装；`pip check`与实际import验证。目标环境需C++/Python开发头、`ninja`、`make`、`pybind11`，检查 `command -v ninja` 后再编译；不要假设python虚拟环境中自带ninja。
 
 ```bash
 # 均为用户实际路径；MF_ROOT/HP_MS_ROOT为独立干净checkout，DATA_PREFIX为现成数据。
@@ -595,7 +645,7 @@ python "$RUN_ROOT/observe_mf.py" --config "$RUN_ROOT/mf.yaml" --ledger "$RUN_ROO
 
 ## MF checkpoint 转换
 
-关闭 MF shell，在新的 HP shell 重新激活 HP 环境并 source CANN 9.2 B237 与 Omni 环境，设置 `HP_ROOT`、`HP_CONFIG`、`RUN_ROOT`、`DATA_PREFIX` 和 `OMNI_PYEXT`，确认 `hyper_parallel.__file__` 指向组装后的 checkout。不要将 MF 的 `PYTHONPATH` 或 CANN 9.1 动态库带入转换和 HP 训练进程。
+关闭 MF shell，在新的 HP shell 重新激活 HP 环境并 source 表中对应的 CANN 9.2 环境，开启融合 mHC 时加载同 ABI 的 Omni 扩展，设置 `HP_ROOT`、`HP_CONFIG`、`RUN_ROOT`、`DATA_PREFIX` 和 `OMNI_PYEXT`，确认 `hyper_parallel.__file__` 指向组装后的 checkout。不要将 MF 的 `PYTHONPATH` 或 CANN 9.1 动态库带入转换和 HP 训练进程。
 
 MF 的 checkpoint callback 会记录并捕获部分保存错误；训练结束不等于保存成功。先确认 step 1500 原生保存成功且该 checkpoint 无写入者，再运行下方 closure 审计；基线不必结束到 2500，只要状态闭合、下一批样本对应，就可在另一空闲卡组并行续训与基线后续步骤。源必须是已完整写完的某个 MF iteration 目录，含模型、FP32主权重、optimizer槽、`common.json`；多rank分片还需原生 `metadata.json` 及其引用的全部文件。无需训练观察器、额外实验manifest或源MF YAML，也无需手填源/目标TP、EP等并行度。
 
