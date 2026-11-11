@@ -33,13 +33,16 @@ UPSTREAM_SHA=$(git rev-parse refs/remotes/xing-upstream/master)
 PR3_SHA=$(git rev-parse refs/remotes/xing-pr/pr3)
 PR2_SHA=$(git rev-parse refs/remotes/xing-pr/pr2)
 
-# PR #3 有一个提交，PR #2 有两个。提交数量变化时先核对 Commits 页。
-git merge-base --is-ancestor "$PR3_SHA^" "$UPSTREAM_SHA"
-git merge-base --is-ancestor "$PR2_SHA~2" "$UPSTREAM_SHA"
+# 首条提交用于确认 PR 边界，后续追加提交会按顺序包含在范围内。
+# 若 PR 经 squash 或改写，核对 Commits 页后更新对应首条 SHA。
+PR3_FIRST=609a91c7c8ba6adc169fbc89751736d65a961ed3
+PR2_FIRST=3bb9478237d8d668ff36c5899041e8546d010a01
+git merge-base --is-ancestor "$PR3_FIRST" "$PR3_SHA"
+git merge-base --is-ancestor "$PR2_FIRST" "$PR2_SHA"
+git merge-base --is-ancestor "$PR3_FIRST^" "$UPSTREAM_SHA"
+git merge-base --is-ancestor "$PR2_FIRST^" "$UPSTREAM_SHA"
 mapfile -t PR3_COMMITS < <(git rev-list --reverse --topo-order "$UPSTREAM_SHA..$PR3_SHA")
 mapfile -t PR2_COMMITS < <(git rev-list --reverse --topo-order "$UPSTREAM_SHA..$PR2_SHA")
-test "${#PR3_COMMITS[@]}" -eq 1
-test "${#PR2_COMMITS[@]}" -eq 2
 printf 'pr3_commit=%s\n' "${PR3_COMMITS[@]}" | tee -a "$(git rev-parse --git-path xing4-assembly.log)"
 printf 'pr2_commit=%s\n' "${PR2_COMMITS[@]}" | tee -a "$(git rev-parse --git-path xing4-assembly.log)"
 ASSEMBLY_BRANCH=codex/xing4-local
@@ -50,8 +53,9 @@ if git show-ref --verify --quiet "refs/heads/$ASSEMBLY_BRANCH"; then
     printf 'backup=%s\n' "$BACKUP_REF"
 fi
 git switch -C "$ASSEMBLY_BRANCH" "$UPSTREAM_SHA"
-git cherry-pick -x "${PR3_COMMITS[@]}"
-git cherry-pick -x "${PR2_COMMITS[@]}"
+if (( ${#PR3_COMMITS[@]} + ${#PR2_COMMITS[@]} )); then
+    git cherry-pick -x "${PR3_COMMITS[@]}" "${PR2_COMMITS[@]}"
+fi
 
 git merge-base --is-ancestor "$UPSTREAM_SHA" HEAD
 test "$(git rev-list --count "$UPSTREAM_SHA"..HEAD)" -eq "$((${#PR3_COMMITS[@]} + ${#PR2_COMMITS[@]}))"
@@ -68,7 +72,7 @@ printf 'upstream=%s pr3=%s pr2=%s assembled=%s tree=%s\n' \
 
 cherry-pick 应用提交相对父提交的增量，不会把私仓旧 master 整棵树覆盖到官方主仓。PR #3 的网页 base 是历史依赖分支，所需 #1453 已在当前主仓内。仍须核对实际提交列表和 diff，确认只有两份 PR 的增量，范围外文件没有回退或删除；提交计数不能替代内容审查，也不能证明未来所有主仓版本都兼容。
 
-执行前核对两份 PR 的 Commits 页。遇到空提交或冲突，脚本会停止；先核对是否已被主仓完整或部分吸收，以及接口是否变化，不机械使用 `--ours`、`--theirs` 或 `--skip`。撤销当前 cherry-pick 可用 `git cherry-pick --abort`。若某 PR 已完整合入，只应用剩余增量；两者均已合入时直接使用官方 master。
+执行前核对两份 PR 的 Commits 页。遇到空提交或冲突，脚本会停止；先核对是否已被主仓完整或部分吸收，以及接口是否变化，不机械使用 `--ours`、`--theirs` 或 `--skip`。解决冲突后用 `git cherry-pick --continue` 应用队列中剩余提交，再核对与主仓的 diff。撤销当前 cherry-pick 可用 `git cherry-pick --abort`。若某 PR 已完整合入，只应用剩余增量；两者均已合入时直接使用官方 master。
 
 联合选择重计算按[总 issue](https://github.com/xingleixu123/hyper-parallel-personal/issues/1)应用主仓 #1538 的增量。组装成功后继续下文安装和训练，将 `.git/xing4-assembly.log` 中的实际 SHA、配置和环境版本一起归档。历史精度结果对应总 issue 中固定的实际运行版本；主仓或任一 PR 更新后，应针对变化复核，不能自动沿用旧结果宣称新版本已验收。
 
@@ -77,7 +81,7 @@ cherry-pick 应用提交相对父提交的增量，不会把私仓旧 master 整
 | 用途 | 源码 | 运行环境 |
 | --- | --- | --- |
 | MF 连续单卡基线 | [Somnus master](https://gitcode.com/Somnus2020/mindformers_formal_v1.0) `62ab670a`，MF 侧 HyperParallel [r1.0.0](https://github.com/mindspore-ai/hyper-parallel/tree/r1.0.0) `c95c7514` | Python 3.12.14，[MindSpore 2.10.0 build `6b7c4b02`](https://repo.mindspore.cn/mindspore/mindspore/version/202611/20261104/r2.10_20261104091850_6b7c4b0274392eb09ee3a5652ba14e3ed7a270b4_newest/unified/aarch64/mindspore-2.10.0-cp312-cp312-linux_aarch64.whl)，CANN 9.1.0 B243，Ascend 910B3 |
-| HP Python 3.11 复验 | 官方 master `79f1597d` 加私仓 #3、#2 的两条实现提交与 [主仓 #1538](https://github.com/mindspore-ai/hyper-parallel/pull/1538)，运行 tree `0e4b1d99` | Python 3.11.18，PyTorch 2.13.0+cpu，Transformers 5.21.0，MindSpore 3.0.0b0 内置 TorchNPU 2.13.0，CANN 9.2.0 B237 / 9.2.1 |
+| HP Python 3.11 复验 | 官方 master `79f1597d` 加私仓 #3、#2 的两条实现提交与 [主仓 #1538](https://github.com/mindspore-ai/hyper-parallel/pull/1538)，运行 tree `0e4b1d99` | Python 3.11.18，PyTorch 2.13.0+cpu，Transformers 5.21.0，MindSpore 3.0.0b0 内置 TorchNPU 2.13.0，CANN 9.2.0 B237 / 9.2.1 B114 |
 | HP 独立 PTA 2.13 长窗 | 同一运行 tree `0e4b1d99` | Python 3.12.14 / 3.12.16，PyTorch 2.13.0+cpu，独立 TorchNPU 2.13.0，Transformers 5.21.0，CANN 9.2.0 B237 / 9.2.1 |
 | HP 独立 PTA 2.12 历史环境 | 对应[总 issue 的历史记录](https://github.com/xingleixu123/hyper-parallel-personal/issues/1) | Python 3.12.14，PyTorch 2.12.0+cpu，TorchNPU 2.12.0.post3，Transformers 5.21.0，CANN 9.2.0 B237，Ascend 910B3 |
 
