@@ -4,6 +4,10 @@
 
 本目录只有 [train_single.yaml](train_single.yaml) 和本文档，MF→HP 转换只有 [tools/convert_mf_checkpoint.py](../../../tools/convert_mf_checkpoint.py) 一个入口。训练直接使用框架 `examples.training_demo.train_text`。两个 PR 尚未合入时，按下文在最新官方 master 上依次应用 PR #3、PR #2；依赖与已验证版本见[总 issue #1](https://github.com/xingleixu123/hyper-parallel-personal/issues/1)顶部表格。
 
+全 MLA 主干和 MTP 使用主仓的 MLA 模块族。模型按 CP 网格选择实现，`cp_size=1` 使用本地 MLA，`cp_size>1` 默认使用 Ulysses。TP=1 时可在 [train_single.yaml](train_single.yaml) 启用示例覆盖，设置 `ulysses_degree: 1` 选择 KV AllGather。两条路径共享交错 RoPE 的 FP32 精度和 Muon QK 裁剪统计。路由、专家分发、FSDP/HSDP 和重计算沿用各自的配置。
+
+这一版依赖主仓的 `ModelAdapterSpec.replacements` 和 `MultiLatentAttention` 接口。基于官方 master 合入下面两份 PR；需要联合选择重计算的验收栈与可直接使用的 YAML 见[总 issue #1](https://github.com/xingleixu123/hyper-parallel-personal/issues/1)。
+
 ## 源码准备：最新主仓 + 两份 PR
 
 应用顺序为 **PR #3（公共 Trainer）→ PR #2（Xing4 模型与转换）**。抓取 PR 当前 head，并应用各自尚未包含在官方 master 中的完整提交范围；PR 追加修复后，只 cherry-pick 最新一个提交会漏掉此前的模型实现。不使用 squash 前的历史提交列表。需要私仓读取权限；以下命令在 Bash 中执行。

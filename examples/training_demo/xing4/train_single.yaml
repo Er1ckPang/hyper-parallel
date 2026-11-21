@@ -225,6 +225,7 @@ plan_overrides:
       kind: module                  # 替换完整Dense/共享专家模块，保持SwiGLU语义和权重映射。
       implementation:
         _target_: hyper_parallel.components.modules.SwiGLUMLP # MF fusedswiglu；复用框架 fused gate/up 与 down。
+        swiglu_limit: 0.0              # MF 此配方关闭 SwiGLU 截断。
   - match: model.layers.0.mlp        # 当前唯一 Dense；与 MF 逻辑 Muon 矩阵边界保持一致。
     params:
       linear_fc1.weight: {tp: replicate} # 保留完整 Dense gate/up 逻辑矩阵，不在本配方另做 TP 切行。
@@ -250,17 +251,13 @@ plan_overrides:
         # fix_router: true         # 仅单独吞吐/压力实验；MF force_expert_balance 并非同义参数。
   - match: mtp.layers.*.mtp_block.mlp.forward # MTP 的实际 MoE decoder；共享上面的 fix_router 设置。
     replace: *moe_forward            # MTP与主干MoE采用相同的专家执行和fix_router配置。
-  - match: '*.self_attn.forward'    # 主干/MTP 的 MLA 注意力并行，cp_size=1 时不启用。
-    when: cp                       # 仅 cp_size>1 时使用，不能与上面的 MoE 绑定混为一条规则。
-    region_dispatch: false         # wrapper 接收框架边界解包的本地张量。
-    replace:
-      kind: method                  # 仅替换MLA前向的CP通信边界，参数仍属于HF模型。
-      implementation:
-        _target_: hyper_parallel.models.xing_4.adapter.distributed.context_parallel.xing4_mla_cp_wrapper # 复用公共MLA CP。
-        ulysses_degree: null       # 自动采用完整 CP 域的 Ulysses；TP+CP 要求本地注意力头数可整除 CP。
-        # ulysses_degree: 1        # 仅 TP=1 时可选 KV AllGather；与 Ulysses 分开记录结果。
-        # overlap: false           # 默认为 False；通信重叠作为独立性能变量。
-        # kv_exchange: all_gather  # 默认交换策略；all_to_all_v 仅按接口适用条件另做实验。
+  # CP 默认采用完整 Ulysses，覆盖主干和 MTP 的 MLA。TP=1 时如需 KV AllGather，启用以下覆盖。
+  # - match: '*.self_attn'
+  #   replace:
+  #     kind: module
+  #     implementation:
+  #       _target_: hyper_parallel.models.xing_4.adapter.distributed.context_parallel.build_xing4_mla_cp
+  #       ulysses_degree: 1
   - match: '*.mlp.shared_experts.linear_fc[12]' # 同时覆盖主干/MTP 共享专家的两次投影。
     when: sequence_parallel        # 本任务 TP>1 即开 SP；单卡/纯 FSDP 不增加该边界。
     params:

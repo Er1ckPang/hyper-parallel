@@ -19,12 +19,9 @@ them and assembles, at construction time, every shared module that carries
 training semantics: fused MLA with per-head logit maxima, the fused mHC pre
 operation, grouped-GEMM experts and the training router.
 
-The recipe still selects, through ``plan_overrides``:
-
-- ``SwiGLUMLP`` for the dense decoder MLPs and ``mlp.shared_experts``; the
-  official MLP computes the same result, so this is a pure performance choice.
-- the context- and expert-parallel rules, which need meshes that do not exist
-  while the model is built.
+The model spec selects MLA context parallelism from the active mesh. Recipes
+can override its exchange strategy and select expert parallelism and fused
+``SwiGLUMLP`` for dense and shared experts through ``plan_overrides``.
 
 The Trainer restores native HP checkpoints by tensor name. Offline conversion
 from MindFormers is handled by ``tools/convert_mf_checkpoint.py``.
@@ -55,14 +52,13 @@ from hyper_parallel.components.functional.mhc_pre import mhc_pre
 from hyper_parallel.components.functional.npu_fusion_attention import (
     _prepare_fusion_attention_context, PACKED_SEQUENCE_ARGUMENTS,
 )
-from hyper_parallel.components.functional.rotary_embedding import (
-    apply_rotary_pos_emb_interleave as fused_rotary,
-)
+from hyper_parallel.components.functional.rotary_embedding import apply_rotary_pos_emb_single
 from hyper_parallel.components.losses.chunked_cross_entropy import chunked_cross_entropy
+from hyper_parallel.components.modules.attention.multi_latent_attention import MultiLatentAttentionModule
+from hyper_parallel.components.modules.attention.multi_latent_attention.multi_latent_attention import apply_mla_rope
 from hyper_parallel.components.modules.grouped_experts import GroupedExperts
-from hyper_parallel.components.modules.mla_attention import MLAAttention
 from hyper_parallel.components.modules.mtp import MTPLayer, build_mtp
-from hyper_parallel.components.modules.rms_norm import RMSNorm
+from hyper_parallel.components.modules.rms_norm import RMSNorm, RMSNormModule
 from hyper_parallel.core.activation_memory.recompute_state import is_recomputing
 from hyper_parallel.core.utils.communication import differentiable_all_reduce, gather_counts_via_all_gather
 from hyper_parallel.data.constants import IGNORE_INDEX
@@ -72,7 +68,6 @@ from hyper_parallel.models.xing_4.transformer.configuration_xing4_0 import Xing4
 from hyper_parallel.models.xing_4.transformer.modeling_xing4_0 import (
     Xing4_0DecoderLayer, Xing4_0ForCausalLM, Xing4_0HyperConnection,
     Xing4_0Model, Xing4_0MoE, Xing4_0PreTrainedModel, Xing4_0RMSNorm, Xing4_0TopkRouter,
-    apply_rotary_pos_emb_interleave,
 )
 
 __all__ = [
@@ -133,7 +128,19 @@ def fusion_attention_with_logit_maxima(module: nn.Module, query: torch.Tensor, k
     return output.view(batch, sequence, heads, -1), None
 
 
-class Xing4MLAAttention(MLAAttention):
+def _xing4_rotary(tensor: torch.Tensor, positions: tuple[torch.Tensor, torch.Tensor],
+                  *, interleaved: bool, fused: bool) -> torch.Tensor:
+    """Rotate BSND position channels in FP32 and return MLA's half-band layout."""
+    if fused:
+        return apply_mla_rope(tensor.float(), positions, interleaved=interleaved).to(tensor.dtype)
+    features = tensor.float()
+    if interleaved:
+        features = features.unflatten(-1, (-1, 2)).transpose(-1, -2).flatten(-2)
+    cos, sin = (part.expand(*features.shape[:2], -1).unsqueeze(-2) for part in positions)
+    return apply_rotary_pos_emb_single(features, cos, sin).to(tensor.dtype)
+
+
+class Xing4MLAAttention(MultiLatentAttentionModule):
     """Fuse MLA projections with FP32 rotary channels and per-head maxima.
 
     The decoder applies the recipe's latent-norm epsilon and attention scaling
@@ -147,27 +154,10 @@ class Xing4MLAAttention(MLAAttention):
             raise ValueError("Xing4 MLA requires interleaved rotary weights")
         self.q_a_layernorm = RMSNorm(module=self.q_a_layernorm)
         self.kv_a_layernorm = RMSNorm(module=self.kv_a_layernorm)
-        self.apply_rotary_pos_emb_interleave = (
-            fused_rotary if getattr(self.config, "apply_rope_fusion", False) else apply_rotary_pos_emb_interleave
-        )
+        self.apply_position = partial(_xing4_rotary, interleaved=self.rotary_interleaved,
+                                      fused=getattr(self.config, "apply_rope_fusion", False))
         self.record_logit_maxima = False
         self.max_logits: torch.Tensor | None = None
-
-    def _project_attention_inputs(self, hidden_states: torch.Tensor,
-                                  position_embeddings: tuple[torch.Tensor, torch.Tensor] | None,
-                                  past_key_values: Any | None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Reuse latent and KV projections, rounding RoPE at each concatenation."""
-        del past_key_values  # The training entry always calls the backbone with use_cache=False.
-        latents = self._project_latents(hidden_states)
-        query_rope, key_rope = self.apply_rotary_pos_emb_interleave(
-            latents.query_rope.float(), latents.key_rope.float(), *position_embeddings,
-        )
-        kv = self.kv_b_proj(latents.kv_nope).view(latents.batch_size, latents.sequence_length, self.num_heads, -1)
-        key_nope, value = kv.transpose(1, 2).split((self.qk_nope_head_dim, self.v_head_dim), dim=-1)
-        query_pass = latents.query_pass.transpose(1, 2)
-        query = torch.cat((query_pass, query_rope.to(query_pass.dtype)), dim=-1)
-        key = torch.cat((key_nope, key_rope.to(key_nope.dtype).expand(-1, self.num_heads, -1, -1)), dim=-1)
-        return query, key, value
 
 
 class Xing4Router(Xing4_0TopkRouter):
@@ -415,14 +405,16 @@ class Xing4DecoderLayer(Xing4_0DecoderLayer):
     def forward(self, hidden_states: torch.Tensor, attention_mask: torch.Tensor | None = None,
                 position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None, **kwargs: Any) -> torch.Tensor:
         """Run the shared blocks with ordinary residuals or fused mHC."""
+        # The HF backbone supplies a shard-local causal mask. MLA builds its causal mask from global lengths.
+        del attention_mask
         if not self.enable_hyper_connections:
             output = self.self_attn(hidden_states=self.input_layernorm(hidden_states),
-                                    position_embeddings=position_embeddings, attention_mask=attention_mask, **kwargs)[0]
+                                    position_embeddings=position_embeddings, **kwargs)[0]
             hidden_states = hidden_states + output
             return hidden_states + self.mlp(self.post_attention_layernorm(hidden_states))
         post, mix, collapsed, residual = self.attn_hc(hidden_states)
         output = self.self_attn(hidden_states=self.input_layernorm(collapsed),
-                                position_embeddings=position_embeddings, attention_mask=attention_mask, **kwargs)[0]
+                                position_embeddings=position_embeddings, **kwargs)[0]
         hidden_states = self._post(output, residual, post, mix)
         post, mix, collapsed, residual = self.ffn_hc(hidden_states)
         output = self.mlp(self.post_attention_layernorm(collapsed))
@@ -451,7 +443,7 @@ def _init_training_weights(owner: Xing4_0PreTrainedModel, module: nn.Module) -> 
         if not getattr(module.hc_scale, "_is_hf_initialized", False):
             module.hc_scale.fill_(owner.config.mhc_init_gating_factor)
         nn.init.zeros_(module.hc_base)
-    elif isinstance(module, RMSNorm):
+    elif isinstance(module, RMSNormModule):
         nn.init.ones_(module.weight)
     elif isinstance(module, GroupedExperts):
         module.reset_parameters()

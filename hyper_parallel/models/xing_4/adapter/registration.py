@@ -14,18 +14,18 @@
 # ============================================================================
 """Register the Xing4 model and its adapter.
 
-Attention context parallelism and expert parallelism are selected through
+Attention context parallelism follows the CP mesh. Expert parallelism uses
 ``plan_overrides``; the optimizer is selected by the ``optimizer`` target.
 Set ``model._target_`` to
 ``hyper_parallel.models.xing_4.modeling_xing4_0.build_model`` to bind CP sequence
 objectives and TP loss-parallel AUX scaling, without recipe ``method_replacements``.
 The model builder also binds TP/CP statistics for every backbone and MTP router.
 ``xing4_ep_compute_fn`` selects EP dispatch or local ``fix_router`` independently.
-See ``examples/training_demo/xing4/train_single.yaml`` and
-``parallel_overrides.yaml`` for complete recipes; Dense MLPs must not match the MoE rule.
+See ``examples/training_demo/xing4/train_single.yaml`` for the plan; Dense MLPs must not match the MoE rule.
 With TP, prefer ``loss_parallel: true`` to avoid full-vocabulary logits gathers.
 """
 
+from collections.abc import Mapping
 from functools import partial
 from importlib import import_module
 from typing import Any
@@ -33,6 +33,20 @@ from typing import Any
 from hyper_parallel.distributed.tensor_parallel.param_role import ParamRole
 from hyper_parallel.models.adapter_spec import ModelAdapterSpec, RecomputePolicy
 from hyper_parallel.models.registry import register_custom_model, register_model_adapter
+from hyper_parallel.models.replacement import ModuleReplacementRequest
+
+
+def _replacements(model: Any, context: Mapping[str, Any]) -> tuple[ModuleReplacementRequest, ...]:
+    """Apply the shared CP implementation to MLA in both the backbone and MTP."""
+    del model
+    if context["cp_size"] == 1:
+        return ()
+    # Model registration precedes construction of the NPU training classes.
+    from hyper_parallel.models.xing_4.adapter.distributed.context_parallel import build_xing4_mla_cp
+    from hyper_parallel.models.xing_4.modeling_xing4_0 import Xing4MLAAttention
+
+    return (ModuleReplacementRequest(match=("*.self_attn",), target=build_xing4_mla_cp,
+                                     module_type=Xing4MLAAttention),)
 
 
 def build_recompute_policy() -> RecomputePolicy:
@@ -75,7 +89,7 @@ register_custom_model(
 XING4_ADAPTER_SPEC = ModelAdapterSpec(
     architecture="Xing4ForCausalLM",
     model_type="xing4_0",
-    context_parallel=partial(import_module, "hyper_parallel.models.xing_4.adapter.distributed.context_parallel"),
+    replacements=_replacements,
     expert_parallel=partial(import_module, "hyper_parallel.models.xing_4.adapter.distributed.expert_parallel"),
     recompute=build_recompute_policy,
     sharding_rules=build_parameter_sharding_rules,
