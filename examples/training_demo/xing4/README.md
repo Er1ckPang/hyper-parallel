@@ -6,7 +6,7 @@
 
 全 MLA 主干和 MTP 使用主仓的 MLA 模块族。模型按 CP 网格选择实现，`cp_size=1` 使用本地 MLA，`cp_size>1` 默认使用 Ulysses。TP=1 时可在 [train_single.yaml](train_single.yaml) 启用示例覆盖，设置 `ulysses_degree: 1` 选择 KV AllGather。两条路径共享交错 RoPE 的 FP32 精度和 Muon QK 裁剪统计。路由、专家分发、FSDP/HSDP 和重计算沿用各自的配置。
 
-这一版依赖主仓的 `ModelAdapterSpec.replacements` 和 `MultiLatentAttention` 接口。基于官方 master 合入下面两份 PR；需要联合选择重计算的验收栈与可直接使用的 YAML 见[总 issue #1](https://github.com/xingleixu123/hyper-parallel-personal/issues/1)。
+这一版依赖主仓的 `ModelAdapterSpec.replacements` 和 `MultiLatentAttention` 接口。500 步全 MLA 对照使用主仓 `ab4e6e4a`。MF 单卡和 HP 纯 FSDP8 从零训练至第 500 步，各自在第 200 步更新后写出 checkpoint；HP 对照第 201–500 步。按主干和 MTP 同开或同关 mHC 选择一套配置。[实跑 YAML 与启动命令](https://github.com/xingleixu123/hyper-parallel-personal/pull/35) · [接入顺序、精度与复现记录](https://github.com/xingleixu123/hyper-parallel-personal/issues/1)。
 
 ## 源码准备：最新主仓 + 两份 PR
 
@@ -84,12 +84,14 @@ cherry-pick 应用提交相对父提交的增量，不会把私仓旧 master 整
 
 | 用途 | 源码 | 运行环境 |
 | --- | --- | --- |
-| MF 连续单卡基线 | [Somnus master](https://gitcode.com/Somnus2020/mindformers_formal_v1.0) `62ab670a`，MF 侧 HyperParallel [r1.0.0](https://github.com/mindspore-ai/hyper-parallel/tree/r1.0.0) `c95c7514` | Python 3.12.14，[MindSpore 2.10.0 build `6b7c4b02`](https://repo.mindspore.cn/mindspore/mindspore/version/202611/20261104/r2.10_20261104091850_6b7c4b0274392eb09ee3a5652ba14e3ed7a270b4_newest/unified/aarch64/mindspore-2.10.0-cp312-cp312-linux_aarch64.whl)，CANN 9.1.0 B243，Ascend 910B3 |
-| HP Python 3.11 复验 | 官方 master `79f1597d` 加私仓 #3、#2 的两条实现提交与 [主仓 #1538](https://github.com/mindspore-ai/hyper-parallel/pull/1538)，运行 tree `0e4b1d99` | Python 3.11.18，PyTorch 2.13.0+cpu，Transformers 5.21.0，MindSpore 3.0.0b0 内置 TorchNPU 2.13.0，CANN 9.2.0 B237 / 9.2.1 B114 |
+| MF 当前 500 步 | Somnus master `c7b7e880`，MF 侧 HP r1.0.0 `446e2b93` | Python 3.12.14，MindSpore 2.10.0，CANN 9.1.0，Ascend 910B3 |
+| HP 当前 500 步 | 官方 master `ab4e6e4a`、私仓 #3 和 #2，完整矩阵另加主仓 #1538 | Python 3.11.18，PyTorch 2.13.0+cpu，MindSpore 3.0.0b0 内置 TorchNPU 2.13.0，Transformers 5.21.0；910B3 使用 CANN 9.2.0，910B4 使用 9.2.1 |
+| MF 历史 2500 步基线 | [Somnus master](https://gitcode.com/Somnus2020/mindformers_formal_v1.0) `62ab670a`，MF 侧 HyperParallel [r1.0.0](https://github.com/mindspore-ai/hyper-parallel/tree/r1.0.0) `c95c7514` | Python 3.12.14，[MindSpore 2.10.0 build `6b7c4b02`](https://repo.mindspore.cn/mindspore/mindspore/version/202611/20261104/r2.10_20261104091850_6b7c4b0274392eb09ee3a5652ba14e3ed7a270b4_newest/unified/aarch64/mindspore-2.10.0-cp312-cp312-linux_aarch64.whl)，CANN 9.1.0 B243，Ascend 910B3 |
+| HP 历史 Python 3.11 复验 | 官方 master `79f1597d` 加私仓 #3、#2 的两条实现提交与 [主仓 #1538](https://github.com/mindspore-ai/hyper-parallel/pull/1538)，运行 tree `0e4b1d99` | Python 3.11.18，PyTorch 2.13.0+cpu，Transformers 5.21.0，MindSpore 3.0.0b0 内置 TorchNPU 2.13.0，CANN 9.2.0 B237 / 9.2.1 B114 |
 | HP 独立 PTA 2.13 长窗 | 同一运行 tree `0e4b1d99` | Python 3.12.14 / 3.12.16，PyTorch 2.13.0+cpu，独立 TorchNPU 2.13.0，Transformers 5.21.0，CANN 9.2.0 B237 / 9.2.1 |
 | HP 独立 PTA 2.12 历史环境 | 对应[总 issue 的历史记录](https://github.com/xingleixu123/hyper-parallel-personal/issues/1) | Python 3.12.14，PyTorch 2.12.0+cpu，TorchNPU 2.12.0.post3，Transformers 5.21.0，CANN 9.2.0 B237，Ascend 910B3 |
 
-MF 连续训练第 1–2500 步，在第 1500 步更新完成后保存模型、优化器、调度器和数据游标。HP 单卡从该 checkpoint 恢复，逐步对照 MF 的第 1501–2500 步。实际验收状态、固定提交和曲线见[总 issue](https://github.com/xingleixu123/hyper-parallel-personal/issues/1)。
+下文的历史长窗示例使用 2500 步配方。MF 连续训练第 1–2500 步，在第 1500 步更新完成后保存模型、优化器、调度器和数据游标。HP 单卡从该 checkpoint 恢复，逐步对照 MF 的第 1501–2500 步。实际验收状态、固定提交和曲线见[总 issue](https://github.com/xingleixu123/hyper-parallel-personal/issues/1)。
 
 ### Python 3.11 与 MindSpore 内置 TorchNPU
 
@@ -130,7 +132,7 @@ PY
 
 版本来源可查 [CANN 下载](https://www.hiascend.com/cann/download)、[TorchNPU Release](https://gitcode.com/Ascend/pytorch/releases)、[MindSpore 构建目录](https://repo.mindspore.cn/mindspore/mindspore/version/)和[版本配套查询](https://www.hiascend.com/developer/download/compatibility)，按架构、Python ABI 和固定 build 选择。
 
-先按[仓库安装指南](../../../docs/installation.md)准备相互匹配的 HP wheel、工具链和依赖。Python 3.11 复验锁定 NumPy 1.26.4。训练依赖包括 PyYAML 6.0.3、safetensors 0.8.0、pydantic 2.13.5、pybind11 3.1.0 和 setuptools 80.9.0；按固定版本准备，不做无约束升级。融合 mHC 还需要与 PTA/CANN/芯片匹配的 Omni Python 扩展及 custom OPP，以下先安装 HP，再构建 Omni。
+先按[仓库安装指南](../../../docs/installation.md)准备相互匹配的 HP wheel、工具链和依赖。Python 3.11 复验锁定 NumPy 1.26.4。训练依赖包括 PyYAML 6.0.3、safetensors 0.8.0、pydantic 2.13.5、pybind11 3.1.0 和 setuptools 80.9.0；按固定版本准备，不做无约束升级。开启融合 mHC 时请准备与目标芯片和 CANN 匹配的 `cann_ops_transformer`。
 
 ```bash
 export HP_ROOT=/absolute/path/to/hyper-parallel
@@ -143,55 +145,29 @@ source "$HP_VENV/bin/activate"
 source "$CANN_ENV"
 cd "$HP_ROOT"
 python -m pip install --use-pep517 --no-build-isolation --no-deps -e .
-./build.sh --multicore off --strict on --jobs 8
+bash hyper_parallel/data/indexed/build.sh
 python -c 'import torch, torch_npu, transformers, hyper_parallel; print(torch.__version__, torch_npu.__version__, transformers.__version__, hyper_parallel.__file__)'
 mkdir -p "$RUN_ROOT"
 ```
 
-`build.sh` 编译 indexed Dataset 的 native helper，需要匹配 Python ABI 的 pybind11 与 C++ 工具链。仅离线转换也使用同一套 HP 模型依赖：转换只在 CPU 构建 meta 状态并做文件 I/O，不占 NPU 卡，但配置解析会导入 PTA/融合算子的动态库。
+`hyper_parallel/data/indexed/build.sh` 为 editable checkout 编译 indexed Dataset 的 native helper，需要匹配 Python ABI 的 pybind11 与 C++ 工具链。仅离线转换也使用同一套 HP 模型依赖：转换只在 CPU 构建 meta 状态并做文件 I/O，不占 NPU 卡，但配置解析会导入 PTA/融合算子的动态库。
 
 更换 HP 版本时，在包含必要依赖的干净 checkout 中固定完整提交，重新安装 editable/wheel，并重建受 ABI 影响的 native 组件。用实际 import 路径、`git rev-parse HEAD`、`pip freeze` 记录生效身份。
 
-## HP Omni 双阶段构建
+## HP 融合 mHC 的 CANN 依赖
 
-在隔离源码副本固定 `45919b54b619ac5532ed2dc83fbca82ddd243540`；确认干净且工具链、磁盘和设备匹配。官方源码地址为 https://gitee.com/omniai/omni-ops ，固定提交已被 fetch，源码与先前构建快照的 2887 个源文件逐字节一致，6 项 OPP 已完成 CPU 重建。`OMNI_ROOT`、`CANN_HOME`、`RUN_ROOT` 指向实际路径；该构建示例是历史 B237 适配经验，必须验证实际环境。
+当前主仓通过 `cann_ops_transformer.ops` 调用 `mhc_pre_sinkhorn` 和 `mhc_post`。在已激活的 HP 环境中加载对应 CANN 9.2 环境，检查两个入口的实际来源。
 
 ```bash
-export CANN_HOME=/absolute/path/to/active-cann-9.2
-export OMNI_ROOT="$RUN_ROOT/omni-ops"
-git clone https://gitee.com/omniai/omni-ops "$OMNI_ROOT"
-git -C "$OMNI_ROOT" checkout --detach 45919b54b619ac5532ed2dc83fbca82ddd243540
-test "$(git -C "$OMNI_ROOT" rev-parse HEAD)" = 45919b54b619ac5532ed2dc83fbca82ddd243540
-cd "$OMNI_ROOT/training/ascendc"
-ops='ai_infra_manifold_constrained_hyper_connection_pre;ai_infra_manifold_constrained_hyper_connection_pre_grad;manifold_constrained_hyper_connection_sinkhorn_enhance;ai_infra_sinkhorn_grad;ai_infra_manifold_constrained_hyper_connection_post;ai_infra_mhc_post_grad'
-PATH="$CANN_HOME/tools/ccec_compiler/bin:$PATH" OPS_CPU_NUMBER=2 bash build.sh -c ascend910b -p "$CANN_HOME" -n "$ops"
-# 仅使用刚生成的唯一安装包。
-mapfile -t omni_installers < <(find "$OMNI_ROOT/training/ascendc" -type f -name 'CANN-omni_training_custom_ops*.run')
-test "${#omni_installers[@]}" -eq 1
-export OMNI_INSTALLER="${omni_installers[0]}"
-sha256sum "$OMNI_INSTALLER"
-bash "$OMNI_INSTALLER" --quiet --install-path="$RUN_ROOT/vendor-opp"
-export ASCEND_CUSTOM_OPP_PATH="${ASCEND_CUSTOM_OPP_PATH:-}"
-source "$RUN_ROOT/vendor-opp/vendors/omni_training_custom_transformer/bin/set_env.bash"
-export CPLUS_INCLUDE_PATH="$RUN_ROOT/vendor-opp/vendors/omni_training_custom_transformer/op_api/include"
-export LIBRARY_PATH="$RUN_ROOT/vendor-opp/vendors/omni_training_custom_transformer/op_api/lib"
-export TORCH_DEVICE_BACKEND_AUTOLOAD="${TORCH_DEVICE_BACKEND_AUTOLOAD:-0}"
-export CC="${CC:-gcc}" CXX="${CXX:-g++}"
-cd "$OMNI_ROOT/training/ascendc/torch_ops_extension"
-# 固定 Omni 版本在 PyTorch 2.13 中使用已移除的头文件。该 include 没有参与算子实现。
-if python -c 'import torch; raise SystemExit(not torch.__version__.startswith("2.13."))'; then
-  sed -i '/^#include <ATen\/NamedTensorUtils.h>$/d' omni_training_custom_ops/csrc_base/ops_common.h
-fi
-python -B setup.py build --parallel 1
-export OMNI_ENV="$RUN_ROOT/vendor-opp/vendors/omni_training_custom_transformer/bin/set_env.bash"
-PY_ABI=$(python -c 'import sys; print(f"{sys.version_info.major}{sys.version_info.minor}")')
-export OMNI_PYEXT="$OMNI_ROOT/training/ascendc/torch_ops_extension/build/lib.linux-aarch64-cpython-$PY_ABI"
-test -d "$OMNI_PYEXT"
-source "$OMNI_ENV"
-export PYTHONPATH="$OMNI_PYEXT${PYTHONPATH:+:$PYTHONPATH}"
+python - <<'PY'
+import cann_ops_transformer
+from cann_ops_transformer.ops import mhc_post, mhc_pre_sinkhorn
+
+print(cann_ops_transformer.__file__, mhc_pre_sinkhorn.__module__, mhc_post.__module__)
+PY
 ```
 
-训练前核对实际加载路径、六项 schema 和 NPU 前后向。干净源码加 fresh Omni 的八卡 FSDP 从 1500 恢复至 1503 已 rc0，24 个输入匹配、payload/live 均通过，八 rank 的进程映射使用新 pyext（`e901...`）和新 libcust（`5469...`）。这是短测，不代表 fresh 产物已通过完整 1000 步。注册成功不等于设备 kernel 可用；安装脚本可能记录绝对路径，移动后须检查。
+上述命令检查 Python 入口。两种 mHC 模式的 NPU 训练记录、设备和 CANN 版本见[精度报告](https://github.com/xingleixu123/hyper-parallel-personal/issues/1)。复现旧版显式 Omni 后端时使用[该版本的构建步骤](https://github.com/xingleixu123/hyper-parallel-personal/blob/2a3ad7b56d1f83585d7bc6d704bf5a7ebe660cfd/examples/training_demo/xing4/README.md#hp-omni-双阶段构建)。
 
 ## 数据和训练配置
 
@@ -306,7 +282,7 @@ print('extension', p, hashlib.sha256(p.read_bytes()).hexdigest())
 PY
 ```
 
-构建仅验证CPU导入。正式运行前设置 `PYTHONPATH="$BUILD_DIR:$MF_ROOT:$HP_MS_ROOT${PYTHONPATH:+:$PYTHONPATH}"`，普通导入 `hyper_parallel.platform.mindspore.custom_ops.custom_op_impl` 并打印 `impl._custom_ops.__file__`、SHA及五个exports；其源码`build/lib`优先，若存在旧so可能覆盖新目录，先检查并明确加载身份。**禁止预先向sys.modules注入so掩盖实际路径**。loader缺`npu_situ_glu`可能自动构建，`HP_CUSTOM_OPS_NO_AUTO_REBUILD=1`不是通用禁止构建；如load失败必须排查。本轮正常loader已记录新b04c扩展路径及SHA并完成三步设备训练；新设备、新环境仍需验证实际加载和前后向。MS wrapper与HP PTA Omni pyext是两条依赖链；目标CANN mHC设备kernel/OPP可用性需环境核验，文档不可暗示源码host so独立提供kernel。
+构建仅验证CPU导入。正式运行前设置 `PYTHONPATH="$BUILD_DIR:$MF_ROOT:$HP_MS_ROOT${PYTHONPATH:+:$PYTHONPATH}"`，普通导入 `hyper_parallel.platform.mindspore.custom_ops.custom_op_impl` 并打印 `impl._custom_ops.__file__`、SHA及五个exports；其源码`build/lib`优先，若存在旧so可能覆盖新目录，先检查并明确加载身份。**禁止预先向sys.modules注入so掩盖实际路径**。loader缺`npu_situ_glu`可能自动构建，`HP_CUSTOM_OPS_NO_AUTO_REBUILD=1`不是通用禁止构建；如load失败必须排查。本轮正常loader已记录新b04c扩展路径及SHA并完成三步设备训练；新设备、新环境仍需验证实际加载和前后向。该扩展供 MF 的 MindSpore 后端使用。HP 的 PyTorch 环境独立加载当前主仓的 CANN 算子。
 
 
 ### 写入 MF 运行配置
@@ -653,7 +629,7 @@ python "$RUN_ROOT/observe_mf.py" --config "$RUN_ROOT/mf.yaml" --ledger "$RUN_ROO
 
 ## MF checkpoint 转换
 
-关闭 MF shell，在新的 HP shell 重新激活 HP 环境并 source 表中对应的 CANN 9.2 环境，开启融合 mHC 时加载同 ABI 的 Omni 扩展，设置 `HP_ROOT`、`HP_CONFIG`、`RUN_ROOT`、`DATA_PREFIX` 和 `OMNI_PYEXT`，确认 `hyper_parallel.__file__` 指向组装后的 checkout。不要将 MF 的 `PYTHONPATH` 或 CANN 9.1 动态库带入转换和 HP 训练进程。
+在独立 shell 激活 HP 环境并加载 CANN 9.2，设置 `HP_ROOT`、`HP_CONFIG`、`RUN_ROOT` 和 `DATA_PREFIX`。用 `python -c 'import hyper_parallel; print(hyper_parallel.__file__)'` 确认加载的是组装后的 checkout。
 
 MF 的 checkpoint callback 会记录并捕获部分保存错误；训练结束不等于保存成功。先确认 step 1500 原生保存成功且该 checkpoint 无写入者，再运行下方 closure 审计；基线不必结束到 2500，只要状态闭合、下一批样本对应，就可在另一空闲卡组并行续训与基线后续步骤。源必须是已完整写完的某个 MF iteration 目录，含模型、FP32主权重、optimizer槽、`common.json`；多rank分片还需原生 `metadata.json` 及其引用的全部文件。无需训练观察器、额外实验manifest或源MF YAML，也无需手填源/目标TP、EP等并行度。
 
@@ -995,7 +971,7 @@ bash "$RUN_ROOT/run_plot_input.sh" "$RUN_ROOT/results/mf-hp-single/per-step.csv"
 
 ## 运行与验证边界
 
-MF clean 62ab/c95 源码重建的 host 扩展完成三步普通 loader 训练，历史完整 2500 步基线使用另一构建产物；两者身份不可混同。fresh Omni 八卡恢复短测的边界如上，完整窗口结果见总 issue。MS 2.10.0 build `6b7c4b02` 的精确 wheel、CANN、设备算子、私有源码权限和数据是前置条件；请按官方渠道核对，不执行升级 MS 的无约束安装。
+MF clean 62ab/c95 源码重建的 host 扩展完成三步普通 loader 训练，历史完整 2500 步基线使用另一构建产物；两者身份不可混同。该历史环境的设备与构建记录见总 issue。MS 2.10.0 build `6b7c4b02` 的精确 wheel、CANN、设备算子、私有源码权限和数据是前置条件；请按官方渠道核对，不执行升级 MS 的无约束安装。
 
 ## 附录：观察与校验脚本
 
