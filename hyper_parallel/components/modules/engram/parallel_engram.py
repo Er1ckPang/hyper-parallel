@@ -303,6 +303,8 @@ class ParallelEngram:
         padded_num_embeddings: int,
     ) -> torch.Tensor:
         """Route requested global rows to their EP owners and restore order."""
+        if ep_size == 1:
+            return embedding(hash_ids)
         if padded_num_embeddings % ep_size:
             raise ValueError(
                 f"Engram padded rows {padded_num_embeddings} are not divisible by ep_size={ep_size}"

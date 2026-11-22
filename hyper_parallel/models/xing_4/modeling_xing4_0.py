@@ -31,7 +31,7 @@ training-checkpoint entry point.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 from dataclasses import replace
 from functools import partial
 from typing import Any
@@ -56,7 +56,11 @@ from hyper_parallel.components.functional.rotary_embedding import apply_rotary_p
 from hyper_parallel.components.losses.chunked_cross_entropy import chunked_cross_entropy
 from hyper_parallel.components.modules.attention.multi_latent_attention import MultiLatentAttentionModule
 from hyper_parallel.components.modules.attention.multi_latent_attention.multi_latent_attention import apply_mla_rope
+from hyper_parallel.components.modules import GroupedExperts as StagedGroupedExperts
+from hyper_parallel.components.modules.engram import Engram, EngramModule
 from hyper_parallel.components.modules.grouped_experts import GroupedExperts
+from hyper_parallel.components.modules.moe.grouped_experts import GroupedExpertsConfig
+from hyper_parallel.components.modules.moe.grouped_experts.grouped_experts import GroupedExpertsModule
 from hyper_parallel.components.modules.mtp import MTPLayer, build_mtp
 from hyper_parallel.components.modules.rms_norm import RMSNorm, RMSNormModule
 from hyper_parallel.core.activation_memory.recompute_state import is_recomputing
@@ -64,6 +68,8 @@ from hyper_parallel.core.utils.communication import differentiable_all_reduce, g
 from hyper_parallel.data.constants import IGNORE_INDEX
 from hyper_parallel.models import HyperAutoModelForCausalLM
 from hyper_parallel.models.materialization import register_rebuildable_buffer
+from hyper_parallel.models.xing_4.adapter.distributed.engram_parallel import with_engram_parallelism
+from hyper_parallel.models.xing_4.engram_config import engram_enabled, merge_engram_config, resolve_engram_layers
 from hyper_parallel.models.xing_4.transformer.configuration_xing4_0 import Xing4_0Config
 from hyper_parallel.models.xing_4.transformer.modeling_xing4_0 import (
     Xing4_0DecoderLayer, Xing4_0ForCausalLM, Xing4_0HyperConnection,
@@ -323,7 +329,14 @@ class Xing4MoE(Xing4_0MoE):
         """Pack the official experts and add the training router and EP boundary."""
         nn.Module.__init__(self)  # pylint: disable=non-parent-init-called
         self.config = config
-        self.experts = build_grouped_experts(config, source.experts)
+        if engram_enabled(config):
+            self.experts = StagedGroupedExperts(config=GroupedExpertsConfig(
+                num_experts=config.n_routed_experts, hidden_size=config.hidden_size,
+                intermediate_size=config.moe_intermediate_size, routing_weight_mode="output",
+                init_method_std=config.initializer_range, num_layers=config.num_hidden_layers,
+            ))
+        else:
+            self.experts = build_grouped_experts(config, source.experts)
         self.gate = Xing4Router(config, source.gate, layer_idx)
         # The recipe replaces this dense MLP with the shared SwiGLUMLP.
         self.shared_experts = source.shared_experts
@@ -403,10 +416,18 @@ class Xing4DecoderLayer(Xing4_0DecoderLayer):
             self.ffn_hc = Xing4FusedHyperConnection(source.ffn_hc)
 
     def forward(self, hidden_states: torch.Tensor, attention_mask: torch.Tensor | None = None,
-                position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None, **kwargs: Any) -> torch.Tensor:
-        """Run the shared blocks with ordinary residuals or fused mHC."""
+                position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
+                engram_input_ids: torch.Tensor | None = None, engram_segment_starts: torch.Tensor | None = None,
+                engram_token_mask: torch.Tensor | None = None, **kwargs: Any) -> torch.Tensor:
+        """Apply Engram before attention and run the configured residual path."""
         # The HF backbone supplies a shard-local causal mask. MLA builds its causal mask from global lengths.
         del attention_mask
+        if hasattr(self, "engram"):
+            if engram_input_ids is None:
+                raise ValueError("Xing4 Engram requires original input_ids for lookup")
+            streams = hidden_states if self.enable_hyper_connections else hidden_states.unsqueeze(2)
+            streams = self.engram(streams, engram_input_ids, engram_segment_starts, engram_token_mask)
+            hidden_states = streams if self.enable_hyper_connections else streams.squeeze(2)
         if not self.enable_hyper_connections:
             output = self.self_attn(hidden_states=self.input_layernorm(hidden_states),
                                     position_embeddings=position_embeddings, **kwargs)[0]
@@ -445,7 +466,7 @@ def _init_training_weights(owner: Xing4_0PreTrainedModel, module: nn.Module) -> 
         nn.init.zeros_(module.hc_base)
     elif isinstance(module, RMSNormModule):
         nn.init.ones_(module.weight)
-    elif isinstance(module, GroupedExperts):
+    elif isinstance(module, (GroupedExperts, GroupedExpertsModule, EngramModule)):
         module.reset_parameters()
     else:
         Xing4_0PreTrainedModel._init_weights(owner, module)
@@ -467,12 +488,15 @@ class Xing4Model(Xing4_0Model):
 
     def __init__(self, config: Any) -> None:
         """Reuse the HF backbone and register RoPE tables for post-sharding materialization."""
+        engram_layers = resolve_engram_layers(config)
         super().__init__(config)
         self.sequence_group = None
         self.layers = nn.ModuleList(
             Xing4DecoderLayer(config, index, enable_hyper_connections=config.enable_hyper_connections, source=layer)
             for index, layer in enumerate(self.layers)
         )
+        for layer_config in engram_layers:
+            self.layers[layer_config.layer_id].engram = Engram(config=layer_config)
         rotary = self.rotary_emb
         rope_init_fn = (rotary.compute_default_rope_parameters if rotary.rope_type == "default"
                         else ROPE_INIT_FUNCTIONS[rotary.rope_type])
@@ -485,12 +509,17 @@ class Xing4Model(Xing4_0Model):
     def forward(self, input_ids: torch.Tensor | None = None, attention_mask: torch.Tensor | None = None,
                 position_ids: torch.Tensor | None = None, past_key_values: Any = None,
                 inputs_embeds: torch.Tensor | None = None, use_cache: bool | None = None,
+                engram_input_ids: torch.Tensor | None = None,
                 **kwargs: Any) -> BaseModelOutputWithPast:
         """Run the backbone for training.
 
         The plain residual path keeps three-dimensional hidden states and
         requires causal attention without an explicit mask or KV cache.
         """
+        if engram_enabled(self.config):
+            if use_cache or past_key_values is not None:
+                raise ValueError("Xing4 Engram training requires complete sequences without KV cache")
+            kwargs["engram_input_ids"] = input_ids if engram_input_ids is None else engram_input_ids
         if self.config.enable_hyper_connections:
             return super().forward(input_ids=input_ids, attention_mask=attention_mask, position_ids=position_ids,
                                    past_key_values=past_key_values, inputs_embeds=inputs_embeds,
@@ -590,7 +619,9 @@ class Xing4ForCausalLM(Xing4_0ForCausalLM):
 
     def forward(self, input_ids: torch.Tensor, labels: torch.Tensor | None = None,
                 shift_labels: torch.Tensor | None = None, position_ids: torch.Tensor | None = None,
-                attention_mask: torch.Tensor | None = None, use_cache: bool = False) -> ModelOutput:
+                attention_mask: torch.Tensor | None = None, use_cache: bool = False,
+                engram_segment_starts: torch.Tensor | None = None,
+                engram_token_mask: torch.Tensor | None = None) -> ModelOutput:
         """Return LM and weighted MTP losses for aligned causal training sequences."""
         del labels
         if attention_mask is not None or use_cache:
@@ -602,7 +633,10 @@ class Xing4ForCausalLM(Xing4_0ForCausalLM):
         for router in self._hash_routers:
             router.token_ids = input_ids
         embeddings = self.model.embed_tokens(input_ids).to(dtype=self.embedding_compute_dtype)
-        hidden = self.model(inputs_embeds=embeddings, position_ids=position_ids, use_cache=False).last_hidden_state
+        hidden = self.model(
+            inputs_embeds=embeddings, position_ids=position_ids, use_cache=False, engram_input_ids=input_ids,
+            engram_segment_starts=engram_segment_starts, engram_token_mask=engram_token_mask,
+        ).last_hidden_state
         targets = shift_labels.masked_fill(shift_labels < 0, IGNORE_INDEX)
         losses = {"foundation_loss": self._cross_entropy(hidden, targets)}
         if self.mtp is not None:
@@ -657,6 +691,7 @@ def create_config(config: dict[str, Any]) -> Xing4_0Config:
         ValueError: If the recipe selects semantics the shared components do not implement.
     """
     values = dict(config)
+    merge_engram_config(values)
     if "use_pad_tokens" in values:
         raise ValueError("Xing4 uses native empty-expert handling; remove use_pad_tokens from the model config")
     for alias, field in (("num_residual_streams", "hc_mult"), ("mhc_sinkhorn_iterations", "hc_sinkhorn_iters"),
@@ -713,9 +748,13 @@ def build_model(*, config: dict[str, Any], **options: Any) -> PreTrainedModel:
         precision = strategy.mix_precision
         custom_params = {name: dtype for name, dtype in precision.custom_params.items()
                          if name not in ("*.attn_hc.*", "*.ffn_hc.*")}
-        options["distributed_setup"] = replace(
+        setup = replace(
             setup, strategy_config=replace(strategy, mix_precision=replace(precision, custom_params=custom_params))
         )
+    if setup is not None and engram_enabled(model_config):
+        setup = with_engram_parallelism(setup)
+    if setup is not None:
+        options["distributed_setup"] = setup
     model = HyperAutoModelForCausalLM.from_config(model_config, **options)
     mesh = getattr(options.get("distributed_setup"), "mesh_context", None)
     if mesh is not None:

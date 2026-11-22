@@ -23,6 +23,7 @@ from typing import Any
 import torch  # pylint: disable=forbidden-backend-import
 
 from hyper_parallel.core.optimizer.muon import NSInputTransform
+from hyper_parallel.models.xing_4.engram_config import engram_enabled
 
 
 @dataclass(frozen=True)
@@ -43,6 +44,7 @@ class Xing4MuonLayout:
     intermediate_size: int
     moe_intermediate_size: int
     n_shared_experts: int = 0
+    staged_experts: bool = False
 
     @classmethod
     def from_config(cls, config: Any) -> "Xing4MuonLayout":
@@ -54,7 +56,9 @@ class Xing4MuonLayout:
         Returns:
             The logical matrix layout.
         """
-        return cls(**{item.name: getattr(config, item.name) for item in fields(cls) if hasattr(config, item.name)})
+        values = {item.name: getattr(config, item.name) for item in fields(cls) if hasattr(config, item.name)}
+        values["staged_experts"] = engram_enabled(config)
+        return cls(**values)
 
     @staticmethod
     def _check_shape(name: str, tensor: torch.Tensor, shape: tuple[int, ...]) -> None:
@@ -83,6 +87,9 @@ class Xing4MuonLayout:
             Matrix views for independent Muon updates.
         """
         if name.endswith(".mlp.experts.gate_up_proj"):
+            if self.staged_experts:
+                self._check_shape(name, tensor, (tensor.shape[0], 2 * self.moe_intermediate_size, self.hidden_size))
+                return list(tensor.split(self.moe_intermediate_size, dim=-2))
             self._check_shape(name, tensor, (tensor.shape[0], self.hidden_size, 2 * self.moe_intermediate_size))
             return list(tensor.split(self.moe_intermediate_size, dim=-1))
         rows = self._row_sections.get(".".join(name.split(".")[-3:]))
@@ -94,8 +101,7 @@ class Xing4MuonLayout:
     def ns_transform_fn(self, name: str, tensor: torch.Tensor) -> NSInputTransform | None:
         """Gather channels across heads and restore native rows after NS.
 
-        Q splits no-RoPE/RoPE; KV splits key/value. Expert gate/up occupy the
-        last axis and are handled by reshape_fn instead.
+        Q splits no-RoPE/RoPE and KV splits key/value. Expert gate/up use reshape_fn.
 
         Args:
             name: Full model parameter name.

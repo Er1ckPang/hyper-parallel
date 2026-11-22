@@ -19,6 +19,7 @@ from typing import Any
 
 import torch
 
+from hyper_parallel.components.modules.moe.grouped_experts.grouped_experts import GroupedExpertsModule
 from hyper_parallel.distributed.expert_parallel.experts import SHARED_MERGE_MODES
 from hyper_parallel.distributed.expert_parallel.recipes import build_ep_compute
 from hyper_parallel.distributed.expert_parallel.routing import resolve_moe_router
@@ -49,11 +50,13 @@ def xing4_ep_compute_fn(*, module: Any, mesh: Any, tp_mesh: Any, cp_mesh: Any,
     """
     del mesh, tp_mesh, cp_mesh
     route = type(module).route
-    executor = None if ep_mesh is None else build_ep_compute(
+    # PR1594 expert members own routing transport; keep the recipe's optional test router.
+    staged = isinstance(module.experts, GroupedExpertsModule)
+    executor = None if ep_mesh is None or staged else build_ep_compute(
         module, ep_mesh, router_fn=route, archetype_key="xing4",
         expected_attrs=["gate", "experts", "shared_experts"], combine=SHARED_MERGE_MODES["none"],
         use_grouped_gemm=True, fix_router=fix_router)
-    if ep_mesh is None:
+    if executor is None:
         route = resolve_moe_router(route, fix_router)
 
     def forward(module: Any, hidden_states: torch.Tensor) -> torch.Tensor:

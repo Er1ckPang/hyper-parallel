@@ -30,23 +30,33 @@ from functools import partial
 from importlib import import_module
 from typing import Any
 
+from hyper_parallel.components.modules import GroupedExperts
+from hyper_parallel.components.modules.moe.grouped_experts.grouped_experts import GroupedExpertsModule
 from hyper_parallel.distributed.tensor_parallel.param_role import ParamRole
 from hyper_parallel.models.adapter_spec import ModelAdapterSpec, RecomputePolicy
 from hyper_parallel.models.registry import register_custom_model, register_model_adapter
 from hyper_parallel.models.replacement import ModuleReplacementRequest
+from hyper_parallel.models.xing_4.engram_config import engram_enabled
 
 
 def _replacements(model: Any, context: Mapping[str, Any]) -> tuple[ModuleReplacementRequest, ...]:
-    """Apply the shared CP implementation to MLA in both the backbone and MTP."""
-    del model
-    if context["cp_size"] == 1:
-        return ()
-    # Model registration precedes construction of the NPU training classes.
-    from hyper_parallel.models.xing_4.adapter.distributed.context_parallel import build_xing4_mla_cp
-    from hyper_parallel.models.xing_4.modeling_xing4_0 import Xing4MLAAttention
+    """Select mesh-aware MLA and routed-expert members at their module boundaries."""
+    requests = []
+    if context["cp_size"] > 1:
+        # The training classes are loaded only after model construction.
+        from hyper_parallel.models.xing_4.adapter.distributed.context_parallel import (  # pylint: disable=C0415
+            build_xing4_mla_cp,
+        )
+        from hyper_parallel.models.xing_4.modeling_xing4_0 import Xing4MLAAttention  # pylint: disable=C0415
 
-    return (ModuleReplacementRequest(match=("*.self_attn",), target=build_xing4_mla_cp,
-                                     module_type=Xing4MLAAttention),)
+        requests.append(ModuleReplacementRequest(
+            match=("*.self_attn",), target=build_xing4_mla_cp, module_type=Xing4MLAAttention,
+        ))
+    if engram_enabled(model.config) and any(isinstance(module, GroupedExpertsModule) for module in model.modules()):
+        requests.append(ModuleReplacementRequest(
+            match=("*.mlp.experts",), target=GroupedExperts, module_type=GroupedExpertsModule,
+        ))
+    return tuple(requests)
 
 
 def build_recompute_policy() -> RecomputePolicy:
@@ -60,9 +70,35 @@ def get_fsdp_excluded_subtrees(model: Any) -> tuple[str, ...]:
 
 
 def get_fsdp_wrap_modules(model: Any) -> tuple[str, ...]:
-    """Keep each MTP depth's parameters under the module that calls its decoder."""
-    return (() if model.mtp is None else
-            tuple(f"mtp.layers.{name}" for name, _ in model.mtp.layers.named_children()))
+    """Wrap each MTP depth and separate EP-owned Engram tables from dense projections."""
+    mtp_units = (() if model.mtp is None else
+                 tuple(f"mtp.layers.{name}" for name, _ in model.mtp.layers.named_children()))
+    engram_units = tuple(
+        fqn for fqn, _ in model.named_modules() if fqn.endswith((".engram.embed", ".engram.wkv"))
+    )
+    return engram_units + mtp_units
+
+
+def get_fsdp_execution_order(model: Any, module_fqns: tuple[str, ...]) -> tuple[str, ...]:
+    """Place Engram children next to the backbone layer that executes them."""
+    del model
+    selected = set(module_fqns)
+    child_suffixes = ("engram.embed", "engram.wkv", "mlp.experts", "mtp_block.mlp.experts")
+    child_units = {
+        f"{parent}.{suffix}"
+        for parent in module_fqns for suffix in child_suffixes
+    } & selected
+    order = []
+    for fqn in module_fqns:
+        if fqn in child_units:
+            continue
+        order.append(fqn)
+        for suffix in child_suffixes:
+            child = f"{fqn}.{suffix}"
+            if child in selected:
+                order.append(child)
+    order.extend(fqn for fqn in module_fqns if fqn not in order)
+    return tuple(order)
 
 
 def build_parameter_sharding_rules() -> list[tuple[list[str], Any]]:
@@ -75,7 +111,7 @@ def build_parameter_sharding_rules() -> list[tuple[list[str], Any]]:
         Name patterns and their parameter roles.
     """
     return [
-        (["linear_qkv"], ParamRole.REPLICATED),
+        (["linear_qkv", "engram"], ParamRole.REPLICATED),
         (["q_b_proj", "kv_b_proj"], ParamRole.COLWISE),
     ]
 
@@ -94,6 +130,7 @@ XING4_ADAPTER_SPEC = ModelAdapterSpec(
     recompute=build_recompute_policy,
     sharding_rules=build_parameter_sharding_rules,
     fsdp_wrap_modules=get_fsdp_wrap_modules,
+    fsdp_execution_order=get_fsdp_execution_order,
     fsdp_excluded_subtrees=get_fsdp_excluded_subtrees,
 )
 register_model_adapter(XING4_ADAPTER_SPEC)

@@ -58,8 +58,6 @@ class AuxiliaryModel(nn.Module):
 class TestTrainerAuxLossScaling(unittest.TestCase):
     """Exercise the actual BaseTrainer microstep and loss aggregation."""
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="onecard", essential_mark="essential")
     def test_rank_average_matches_equal_microbatch_objective(self) -> None:
         """Match equal microbatch weights for independent main, MTP and auxiliary branches.
 
@@ -100,8 +98,6 @@ class TestTrainerAuxLossScaling(unittest.TestCase):
         self.assertEqual(trainer.step_micro_batches, 0)
 
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="onecard", essential_mark="essential")
     def test_unequal_microbatches_match_weighted_explicit_objective(self) -> None:
         """
         Feature: Auxiliary-loss training lifecycle.
